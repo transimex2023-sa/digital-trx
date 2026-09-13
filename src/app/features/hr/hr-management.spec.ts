@@ -49,8 +49,8 @@ describe('HrManagement Component', () => {
       users: () => sampleUsers,
       isLoading: () => false,
       error: () => null,
-      createUser: jasmine.createSpy('createUser').and.resolveTo({ user: sampleUsers[1] }),
-      updateUser: jasmine.createSpy('updateUser').and.resolveTo(sampleUsers[1]),
+      createUser: jasmine.createSpy('createUser').and.resolveTo({ success: true, user: sampleUsers[1] }),
+      updateUser: jasmine.createSpy('updateUser').and.resolveTo({ success: true, user: sampleUsers[1] }),
     };
 
     mockAuthService = {

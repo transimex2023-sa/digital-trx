@@ -70,13 +70,11 @@ function getSupabaseAdmin() {
   });
 }
 
-// Configuration des administrateurs système permanents (inviolables et extensibles via variable d'environnement ADMIN_EMAILS)
-
-
-const PERMANENT_ADMIN_EMAILS = (process.env['ADMIN_EMAILS'] || '')
-  .split(',')
-  .map((e) => e.trim().toLowerCase())
-  .filter(Boolean);
+// Configuration de l'administrateur système permanent unique
+const PERMANENT_ADMIN_EMAILS = [
+  'erwinalberic09@gmail.com',
+  ...(process.env['ADMIN_EMAILS'] || '').split(',').map((e) => e.trim().toLowerCase()).filter(Boolean),
+];
 
 /**
  * Fonction centrale et sécurisée de résolution de rôle serveur (RBAC).
@@ -209,7 +207,9 @@ export async function requireAdmin(req: express.Request, res: express.Response, 
 
     const resolvedRole = await resolveServerRole(supabaseAdmin, user);
     if (resolvedRole !== 'admin') {
-      res.status(403).json({ error: 'Accès refusé. Rôle administrateur requis.' });
+      res.status(403).json({
+        error: `Accès refusé. Cette opération exige les privilèges de l'administrateur principal (connecté en tant que: ${user.email || 'anonyme'}). Seul l'administrateur erwinalberic09@gmail.com peut gérer les comptes utilisateurs.`,
+      });
       return;
     }
 
@@ -468,7 +468,7 @@ const createCollaboratorHandler = async (req: express.Request, res: express.Resp
     }
     const authUserId = adminAuthData.user.id;
 
-    // 3. Synchronisation avec la table public.profiles
+    // 3. Synchronisation avec la table public.profiles (avec onConflict: 'id' pour gérer les triggers Supabase automatiques)
     const profilePayload = {
       id: authUserId,
       email,
@@ -483,7 +483,7 @@ const createCollaboratorHandler = async (req: express.Request, res: express.Resp
 
     const { error: profileError } = await adminClient
       .from('profiles')
-      .upsert(profilePayload);
+      .upsert(profilePayload, { onConflict: 'id' });
 
     if (profileError) {
       console.error('Échec synchronisation profiles:', profileError.message);

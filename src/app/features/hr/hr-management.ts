@@ -148,17 +148,20 @@ export class HrManagement {
       const editId = this.editingUserId();
       if (editId) {
         // Mode mise à jour du profil et rôle
-        await this.userService.updateUser(editId, {
+        const res = await this.userService.updateUser(editId, {
           firstName: formVal.firstName.trim(),
           lastName: formVal.lastName.trim(),
           role: formVal.role as UserRole,
           department: formVal.department.trim(),
           phone: formVal.phone.trim(),
         });
+        if (!res.success) {
+          throw new Error(res.error || 'Échec de la mise à jour du collaborateur');
+        }
         this.successMessage.set(`Collaborateur ${formVal.firstName} mis à jour avec le rôle ${this.getRoleLabel(formVal.role as UserRole)}.`);
       } else {
         // Mode création nouvel utilisateur avec rôle
-        await this.userService.createUser({
+        const res = await this.userService.createUser({
           email: formVal.email.trim().toLowerCase(),
           firstName: formVal.firstName.trim(),
           lastName: formVal.lastName.trim(),
@@ -167,6 +170,9 @@ export class HrManagement {
           phone: formVal.phone.trim(),
           tempPassword: formVal.tempPassword.trim(),
         });
+        if (!res.success) {
+          throw new Error(res.error || 'Échec de la création du compte en base de données');
+        }
         this.successMessage.set(`Collaborateur ${formVal.firstName} créé avec succès. Rôle attribué : ${this.getRoleLabel(formVal.role as UserRole)}.`);
       }
 
