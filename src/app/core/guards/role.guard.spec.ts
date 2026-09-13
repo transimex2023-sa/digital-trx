@@ -71,6 +71,27 @@ describe('roleGuard (Niveau 2 de Sécurité RBAC)', () => {
     expect(result).toBe(true);
   });
 
+  it('devrait autoriser le rôle trésorier sur une route réservée aux managers', async () => {
+    authServiceMock.currentUser.mockReturnValue({
+      id: 'tresorier-1',
+      email: 'tresorier@transmex.cm',
+      role: 'tresorier',
+    });
+
+    const routeSnapshot = {
+      data: { roles: ['manager'] },
+    } as unknown as ActivatedRouteSnapshot;
+
+    const stateSnapshot = {} as RouterStateSnapshot;
+
+    const result = await TestBed.runInInjectionContext(() =>
+      roleGuard(routeSnapshot, stateSnapshot)
+    );
+
+    expect(authServiceMock.waitForSession).toHaveBeenCalled();
+    expect(result).toBe(true);
+  });
+
   it('devrait bloquer et rediriger vers /dashboard si l’utilisateur a le rôle employé ou opérateur', async () => {
     authServiceMock.currentUser.mockReturnValue({
       id: 'user-2',

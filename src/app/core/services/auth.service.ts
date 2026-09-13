@@ -46,7 +46,8 @@ export class AuthService {
   public readonly isAuthenticated = computed(() => this._currentUser() !== null);
   public readonly currentRole = computed<UserRole | null>(() => this._currentUser()?.role ?? null);
   public readonly isAdmin = computed(() => this._currentUser()?.role === 'admin');
-  public readonly isManager = computed(() => this._currentUser()?.role === 'manager' || this._currentUser()?.role === 'admin');
+  public readonly isManager = computed(() => this._currentUser()?.role === 'manager' || this._currentUser()?.role === 'tresorier' || this._currentUser()?.role === 'admin');
+  public readonly isTresorier = computed(() => this._currentUser()?.role === 'tresorier' || this._currentUser()?.role === 'admin');
   public readonly isCaissiere = computed(() => this._currentUser()?.role === 'caissiere' || this._currentUser()?.role === 'admin');
   public readonly isEmploye = computed(() => this._currentUser()?.role === 'employe' || this._currentUser()?.role === 'admin');
 

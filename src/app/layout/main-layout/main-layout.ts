@@ -79,7 +79,7 @@ export class MainLayout {
       label: 'Tableau de bord',
       route: '/dashboard',
       icon: 'dashboard',
-      allowedRoles: ['admin', 'manager', 'caissiere', 'employe'],
+      allowedRoles: ['admin', 'manager', 'caissiere', 'employe', 'tresorier'],
     },
     {
       id: 'caisse',
@@ -109,7 +109,8 @@ export class MainLayout {
     const user = this.currentUser();
     if (!user) return [];
     return this.allMenuItems.filter((item) =>
-      item.allowedRoles.includes(user.role)
+      item.allowedRoles.includes(user.role) ||
+      (user.role === 'tresorier' && item.allowedRoles.includes('manager'))
     );
   });
 

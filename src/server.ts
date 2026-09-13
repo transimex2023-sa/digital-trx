@@ -9,6 +9,7 @@ import {join} from 'node:path';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import dotenv from 'dotenv';
 import { normalizeUserRole } from './app/core/utils/role.utils';
+import { UserRole } from './app/core/models/auth.model';
 
 // Charger les variables d'environnement depuis le fichier `.env` (si présent)
 dotenv.config();
@@ -88,7 +89,7 @@ const PERMANENT_ADMIN_EMAILS = (process.env['ADMIN_EMAILS'] || '')
 export async function resolveServerRole(
   supabaseAdmin: SupabaseClient,
   user: { id: string; email?: string | null; app_metadata?: Record<string, unknown> }
-): Promise<'admin' | 'caissiere' | 'manager' | 'employe'> {
+): Promise<UserRole> {
   const email = (user.email || '').toLowerCase().trim();
   if (PERMANENT_ADMIN_EMAILS.includes(email)) {
     return 'admin';
@@ -158,11 +159,17 @@ export async function requireAuth(req: express.Request, res: express.Response, n
 /**
  * Middleware de contrôle d'accès basé sur les rôles (RBAC).
  * Exige que le rôle résolu de l'utilisateur fasse partie des rôles autorisés.
+ * Le rôle 'tresorier' hérite des mêmes autorisations que 'manager'.
  */
-export function requireRole(allowedRoles: ('admin' | 'caissiere' | 'manager' | 'employe')[]) {
+export function requireRole(allowedRoles: UserRole[]) {
   return (req: express.Request, res: express.Response, next: express.NextFunction): void => {
-    const user = (req as unknown as Record<string, unknown>)['user'] as { role?: string; email?: string } | undefined;
-    if (!user || !user.role || !allowedRoles.includes(user.role as 'admin' | 'caissiere' | 'manager' | 'employe')) {
+    const user = (req as unknown as Record<string, unknown>)['user'] as { role?: UserRole; email?: string } | undefined;
+    const userRole = user?.role;
+    const isAllowed = userRole && (
+      allowedRoles.includes(userRole) ||
+      (userRole === 'tresorier' && allowedRoles.includes('manager'))
+    );
+    if (!isAllowed) {
       res.status(403).json({ error: 'Accès refusé. Privilèges insuffisants pour exécuter cette opération.' });
       return;
     }
@@ -420,9 +427,9 @@ const createCollaboratorHandler = async (req: express.Request, res: express.Resp
     return;
   }
 
-  const validRoles = ['admin', 'manager', 'caissiere', 'employe'];
+  const validRoles: UserRole[] = ['admin', 'manager', 'tresorier', 'caissiere', 'employe'];
   if (!role || !validRoles.includes(role)) {
-    res.status(400).json({ error: 'Le rôle Transmex est obligatoire et doit être défini explicitement (admin, manager, caissiere, employe)' });
+    res.status(400).json({ error: 'Le rôle Transmex est obligatoire et doit être défini explicitement (admin, manager, tresorier, caissiere, employe)' });
     return;
   }
 
