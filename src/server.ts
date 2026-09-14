@@ -70,16 +70,19 @@ function getSupabaseAdmin() {
   });
 }
 
-// Configuration des administrateurs système permanents
-const PERMANENT_ADMIN_EMAILS = [
-  'erwinalberic09@gmail.com',
-  ...(process.env['ADMIN_EMAILS'] || '').split(',').map((e) => e.trim().toLowerCase()).filter(Boolean),
-];
+// Configuration des administrateurs système configurés par variable d'environnement
+// Aucun email personnel n'est codé en dur dans le code source
+const getAdminEmailsFromEnv = (): string[] => {
+  return (process.env['ADMIN_EMAILS'] || '')
+    .split(',')
+    .map((e) => e.trim().toLowerCase())
+    .filter(Boolean);
+};
 
 /**
  * Fonction centrale et sécurisée de résolution de rôle serveur (RBAC).
  * SÉCURITÉ ABSOLUE : `user_metadata` est STRICTEMENT EXCLU de toute décision d'autorisation.
- * 1. Email admin permanent (erwinalberic99@gmail.com, etc.) -> 'admin'
+ * 1. Email admin déclaré dans la variable d'environnement ADMIN_EMAILS -> 'admin'
  * 2. app_metadata.role (scellé serveur par Supabase Admin) -> si différent de 'employe'
  * 3. public.profiles.role (table SQL sécurisée)
  * 4. Défaut : 'employe'
@@ -89,7 +92,8 @@ export async function resolveServerRole(
   user: { id: string; email?: string | null; app_metadata?: Record<string, unknown> }
 ): Promise<UserRole> {
   const email = (user.email || '').toLowerCase().trim();
-  if (PERMANENT_ADMIN_EMAILS.includes(email)) {
+  const adminEmails = getAdminEmailsFromEnv();
+  if (email && adminEmails.includes(email)) {
     return 'admin';
   }
 
@@ -424,6 +428,18 @@ const createCollaboratorHandler = async (req: express.Request, res: express.Resp
 
   if (!email || !password) {
     res.status(400).json({ error: 'Email et mot de passe initial obligatoires' });
+    return;
+  }
+
+  // Vérification de robustesse minimale du mot de passe initial
+  if (typeof password !== 'string' || password.length < 8) {
+    res.status(400).json({ error: 'Le mot de passe initial doit comporter au moins 8 caractères' });
+    return;
+  }
+  const hasLetter = /[a-zA-Z]/.test(password);
+  const hasDigit = /[0-9]/.test(password);
+  if (!hasLetter || !hasDigit) {
+    res.status(400).json({ error: 'Le mot de passe initial doit comporter au moins une lettre et un chiffre' });
     return;
   }
 
@@ -898,7 +914,7 @@ const updateOperationHandler = async (req: express.Request, res: express.Respons
     if (authenticatedUser?.role !== 'admin') {
       const { data: existingRow, error: fetchError } = await adminClient
         .from('cashier_transactions')
-        .select('created_by')
+        .select('created_by, employee_id')
         .eq('id', targetId)
         .maybeSingle();
 
@@ -910,7 +926,13 @@ const updateOperationHandler = async (req: express.Request, res: express.Respons
         res.status(404).json({ error: 'Opération introuvable' });
         return;
       }
-      if (existingRow.created_by && existingRow.created_by !== authenticatedUser?.id) {
+      const creator = String(existingRow.created_by || existingRow.employee_id || '').trim();
+      const userEmail = (authenticatedUser?.email || '').toLowerCase().trim();
+      const callerId = authenticatedUser?.id;
+      const matchesId = callerId && creator === callerId;
+      const matchesEmail = userEmail && creator.toLowerCase() === userEmail;
+
+      if (creator && !matchesId && !matchesEmail) {
         res.status(403).json({ error: 'Action refusée : vous ne pouvez modifier que les opérations que vous avez vous-même enregistrées.' });
         return;
       }
@@ -1044,7 +1066,7 @@ const updateOperationHandler = async (req: express.Request, res: express.Respons
  * Suppression d'opérations de caisse (DELETE /api/cahier/operations & /api/cashier/transactions)
  * RÈGLE MÉTIER STRICTE :
  * - Les administrateurs ('admin') peuvent tout supprimer.
- * - Les autres rôles autorisés ('caissiere', 'manager') ne peuvent supprimer UNIQUEMENT que les opérations qu'ils ont eux-mêmes créées.
+ * - Tous les autres utilisateurs ('caissiere', 'manager', 'tresorier', 'employe') ne peuvent supprimer UNIQUEMENT que les opérations qu'ils ont eux-mêmes créées.
  */
 const deleteOperationsHandler = async (req: express.Request, res: express.Response): Promise<void> => {
   const adminClient = getSupabaseAdmin();
@@ -1074,7 +1096,7 @@ const deleteOperationsHandler = async (req: express.Request, res: express.Respon
       return;
     }
 
-    // Si l'utilisateur n'est pas admin, vérifier les autorisations
+    // Si l'utilisateur n'est pas admin, vérifier les autorisations de propriété stricte
     if (!isAdmin) {
       if (!callerId) {
         res.status(403).json({ error: 'Utilisateur non identifié. Suppression refusée.' });
@@ -1091,17 +1113,21 @@ const deleteOperationsHandler = async (req: express.Request, res: express.Respon
         return;
       }
 
-      // Pour les caissières ou managers : ne bloquer que si la ligne a un created_by ou employee_id défini et différent de l'utilisateur courant
+      // Pour tout utilisateur non-admin (caissières, managers, trésoriers, employés) :
+      // ne bloquer que si la ligne a un created_by ou employee_id défini et différent de l'utilisateur courant (par id ou email)
+      const userEmail = (authenticatedUser?.email || '').toLowerCase().trim();
       const unauthorizedRows = rowsToCheck.filter((r) => {
-        const creator = r.created_by || r.employee_id;
-        // Si aucun créateur n'était renseigné sur la ligne historique, autoriser la suppression par le personnel de caisse
+        const creator = String(r.created_by || r.employee_id || '').trim();
+        // Si aucun créateur n'était renseigné sur la ligne historique, autoriser la suppression
         if (!creator) return false;
-        return creator !== callerId;
+        const matchesId = callerId && creator === callerId;
+        const matchesEmail = userEmail && creator.toLowerCase() === userEmail;
+        return !matchesId && !matchesEmail;
       });
 
       if (unauthorizedRows.length > 0) {
         res.status(403).json({
-          error: `Vous ne pouvez supprimer que les opérations créées par vous-même (${unauthorizedRows.length} opération(s) non autorisée(s)).`,
+          error: 'Action refusée : vous ne pouvez modifier que les opérations que vous avez vous-même enregistrées.',
         });
         return;
       }
@@ -1145,6 +1171,7 @@ const duplicateOperationsHandler = async (req: express.Request, res: express.Res
   try {
     const authenticatedUser = (req as unknown as Record<string, unknown>)['user'] as { id?: string; email?: string; role?: string } | undefined;
     const callerId = authenticatedUser?.id || null;
+    const userRole = authenticatedUser?.role;
 
     const bodyIds = Array.isArray(req.body?.ids) ? req.body.ids : [];
     if (bodyIds.length === 0) {
@@ -1161,6 +1188,25 @@ const duplicateOperationsHandler = async (req: express.Request, res: express.Res
     if (fetchErr || !originalRows || originalRows.length === 0) {
       res.status(404).json({ error: 'Aucune opération trouvée pour duplication' });
       return;
+    }
+
+    // Contrôle d'appartenance pour les rôles non-admin : on ne peut dupliquer que ses propres opérations
+    if (userRole !== 'admin') {
+      if (!callerId) {
+        res.status(403).json({ error: 'Utilisateur non identifié. Duplication refusée.' });
+        return;
+      }
+      const unauthorizedRows = originalRows.filter((r) => {
+        const creator = r.created_by || r.employee_id;
+        if (!creator) return false; // Tolérance pour les lignes historiques sans auteur
+        return creator !== callerId;
+      });
+      if (unauthorizedRows.length > 0) {
+        res.status(403).json({
+          error: `Vous ne pouvez dupliquer que vos propres opérations (${unauthorizedRows.length} opération(s) non autorisée(s)).`,
+        });
+        return;
+      }
     }
 
     const todayIso = new Date().toISOString();
@@ -1216,12 +1262,47 @@ const updateOperationsStatusHandler = async (req: express.Request, res: express.
   }
 
   try {
+    const authenticatedUser = (req as unknown as Record<string, unknown>)['user'] as { id?: string; email?: string; role?: string } | undefined;
+    const callerId = authenticatedUser?.id || null;
+    const userRole = authenticatedUser?.role;
+
     const bodyIds = Array.isArray(req.body?.ids) ? req.body.ids : [];
     const newStatus = req.body?.status === 'posted' ? 'posted' : (req.body?.status === 'cancelled' ? 'cancelled' : 'draft');
 
     if (bodyIds.length === 0) {
       res.status(400).json({ error: 'Aucun identifiant fourni' });
       return;
+    }
+
+    // Contrôle d'appartenance pour les non-admins : interdiction de changer le statut des opérations créées par un tiers
+    if (userRole !== 'admin') {
+      if (!callerId) {
+        res.status(403).json({ error: 'Utilisateur non identifié. Modification de statut refusée.' });
+        return;
+      }
+
+      const { data: rowsToCheck, error: fetchErr } = await adminClient
+        .from('cashier_transactions')
+        .select('id, created_by, employee_id')
+        .in('id', bodyIds);
+
+      if (fetchErr || !rowsToCheck) {
+        res.status(500).json({ error: 'Impossible de vérifier la propriété des opérations' });
+        return;
+      }
+
+      const unauthorizedRows = rowsToCheck.filter((r) => {
+        const creator = r.created_by || r.employee_id;
+        if (!creator) return false;
+        return creator !== callerId;
+      });
+
+      if (unauthorizedRows.length > 0) {
+        res.status(403).json({
+          error: `Vous ne pouvez modifier le statut que de vos propres opérations (${unauthorizedRows.length} opération(s) non autorisée(s)).`,
+        });
+        return;
+      }
     }
 
     const { data: updatedRows, error: updateErr } = await adminClient
@@ -1268,11 +1349,11 @@ app.put('/api/cashier/transactions/:id', requireAuth, requireRole(['admin', 'cai
 app.patch('/api/cahier/operations/:id', requireAuth, requireRole(['admin', 'caissiere', 'manager']), updateOperationHandler);
 app.patch('/api/cashier/transactions/:id', requireAuth, requireRole(['admin', 'caissiere', 'manager']), updateOperationHandler);
 
-// Suppression : autorisée pour admin, caissiere et manager (avec vérification de propriété stricte pour les non-admin)
-app.delete('/api/cahier/operations/:id', requireAuth, requireRole(['admin', 'caissiere', 'manager']), deleteOperationsHandler);
-app.delete('/api/cashier/transactions/:id', requireAuth, requireRole(['admin', 'caissiere', 'manager']), deleteOperationsHandler);
-app.delete('/api/cahier/operations', requireAuth, requireRole(['admin', 'caissiere', 'manager']), deleteOperationsHandler);
-app.delete('/api/cashier/transactions', requireAuth, requireRole(['admin', 'caissiere', 'manager']), deleteOperationsHandler);
+// Suppression : autorisée pour tout utilisateur authentifié (vérification stricte de propriété dans deleteOperationsHandler)
+app.delete('/api/cahier/operations/:id', requireAuth, deleteOperationsHandler);
+app.delete('/api/cashier/transactions/:id', requireAuth, deleteOperationsHandler);
+app.delete('/api/cahier/operations', requireAuth, deleteOperationsHandler);
+app.delete('/api/cashier/transactions', requireAuth, deleteOperationsHandler);
 
 /**
  * Example Express Rest API endpoints can be defined here.
