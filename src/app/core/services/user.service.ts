@@ -296,6 +296,9 @@ export class UserService {
     this._error.set(null);
 
     try {
+      let updateSucceeded = false;
+      let lastErrorMessage = '';
+
       if (this.isBrowser) {
         try {
           const authToken = await this.getAuthToken();
@@ -304,17 +307,25 @@ export class UserService {
             headers['Authorization'] = `Bearer ${authToken}`;
           }
 
-          await fetch(`/api/system/collaborators/${id}`, {
+          const res = await fetch(`/api/system/collaborators/${id}`, {
             method: 'PATCH',
             headers,
             body: JSON.stringify(payload),
           });
-        } catch {
-          // Ignorer et basculer en mode client direct
+
+          if (res.ok) {
+            updateSucceeded = true;
+          } else {
+            const errData = await res.json().catch(() => null);
+            lastErrorMessage = errData?.error || `Erreur serveur (${res.status})`;
+          }
+        } catch (fetchErr) {
+          lastErrorMessage = fetchErr instanceof Error ? fetchErr.message : 'Erreur de connexion';
         }
       }
 
-      if (this.checkSupabaseConfigured() && this.supabaseService.supabase) {
+      // Repli direct Supabase si l'API Express n'a pas pu être atteinte
+      if (!updateSucceeded && this.checkSupabaseConfigured() && this.supabaseService.supabase) {
         const updateData: Record<string, unknown> = {};
         if (payload.firstName !== undefined) updateData['first_name'] = payload.firstName;
         if (payload.lastName !== undefined) updateData['last_name'] = payload.lastName;
@@ -324,7 +335,16 @@ export class UserService {
         if (payload.isActive !== undefined) updateData['is_active'] = payload.isActive;
         if (payload.avatarUrl !== undefined) updateData['avatar_url'] = payload.avatarUrl;
 
-        await this.supabaseService.supabase.from('profiles').update(updateData).eq('id', id);
+        const { error: directErr } = await this.supabaseService.supabase.from('profiles').update(updateData).eq('id', id);
+        if (!directErr) {
+          updateSucceeded = true;
+        } else if (!lastErrorMessage) {
+          lastErrorMessage = directErr.message;
+        }
+      }
+
+      if (!updateSucceeded) {
+        throw new Error(lastErrorMessage || 'Échec de l’enregistrement du rôle en base de données.');
       }
 
       const updatedList = this._users().map((u) => {
