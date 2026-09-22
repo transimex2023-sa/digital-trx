@@ -6,10 +6,21 @@ import {
 } from '@angular/ssr/node';
 import express from 'express';
 import {join} from 'node:path';
-import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import { SupabaseClient } from '@supabase/supabase-js';
 import dotenv from 'dotenv';
-import { normalizeUserRole } from './app/core/utils/role.utils';
+import { rateLimit } from 'express-rate-limit';
+import helmet from 'helmet';
 import { UserRole } from './app/core/models/auth.model';
+import { getSupabaseAdmin, requireAdmin, requireAuth, requireRole } from './server/auth';
+import { getSupabaseConfigHandler } from './server/config';
+import { formatPersistedPieceComptable, normalizeDateToDay } from './server/cashier.utils';
+import { updateCurrentUserProfileHandler } from './server/profile';
+import { createCollaboratorHandler } from './server/collaborators.create';
+import { getCollaboratorsHandler } from './server/collaborators.list';
+import { deleteCollaboratorHandler, updateCollaboratorHandler } from './server/collaborators.manage';
+import { getOperationsHandler } from './server/cashier.read';
+import { auditPiecesComptablesHandler } from './server/cashier.audit';
+import { writeAuditLog } from './server/audit-log';
 
 // Charger les variables d'environnement depuis le fichier `.env` (si présent)
 dotenv.config();
@@ -19,341 +30,114 @@ const browserDistFolder = join(import.meta.dirname, '../browser');
 const app = express();
 const angularApp = new AngularNodeAppEngine();
 
-// Parsing JSON pour les requêtes d'API avec limite explicite
+// Configuration du reverse proxy pour Cloud Run / Nginx (gestion sécurisée de l'en-tête X-Forwarded-For)
+app.set('trust proxy', 1);
+
+// En-têtes de sécurité HTTP via Helmet durcis pour Angular SSR et compatibilité iFrame AI Studio
+app.use(
+  helmet({
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        scriptSrc: ["'self'", "'unsafe-inline'", "'unsafe-eval'"],
+        styleSrc: ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
+        fontSrc: ["'self'", 'https://fonts.gstatic.com', 'data:'],
+        imgSrc: ["'self'", 'data:', 'blob:', 'https:'],
+        connectSrc: ["'self'", 'https:', 'wss:'],
+        frameAncestors: ["'self'", 'https://ai.studio', 'https://*.google.com', 'https://*.run.app'],
+        objectSrc: ["'none'"],
+        upgradeInsecureRequests: process.env['NODE_ENV'] === 'production' ? [] : null,
+      },
+    },
+    crossOriginEmbedderPolicy: false,
+    crossOriginResourcePolicy: { policy: 'cross-origin' },
+    frameguard: false, // Délégué à CSP frameAncestors pour autoriser l'iFrame de prévisualisation AI Studio
+    referrerPolicy: { policy: 'strict-origin-when-cross-origin' },
+    strictTransportSecurity: {
+      maxAge: 31536000,
+      includeSubDomains: true,
+      preload: true,
+    },
+    xContentTypeOptions: true,
+    xXssProtection: true,
+  })
+);
+
+// Parsing JSON pour les requêtes d'API avec limite explicite de payload
 app.use(express.json({ limit: '256kb' }));
 
 /**
- * Endpoint sécurisé fournissant l'URL et la clé anonyme publiques Supabase au client web.
- * Supporte /api/supabase-config et /api/config avec gestion de variabilité de nommage sur Vercel.
+ * ==============================================================================
+ * RATE LIMITING STRATIFIÉ (SÉCURITÉ & PROTECTION CONTRE LE BRUTE-FORCE / ABUS)
+ * ==============================================================================
  */
-const getSupabaseConfigHandler = (_req: express.Request, res: express.Response) => {
-  const url =
-    process.env['SUPABASE_URL'] ||
-    process.env['PUBLIC_SUPABASE_URL'] ||
-    process.env['NEXT_PUBLIC_SUPABASE_URL'] ||
-    process.env['VITE_SUPABASE_URL'] ||
-    '';
-  const anonKey =
-    process.env['SUPABASE_ANON_KEY'] ||
-    process.env['PUBLIC_SUPABASE_ANON_KEY'] ||
-    process.env['NEXT_PUBLIC_SUPABASE_ANON_KEY'] ||
-    process.env['VITE_SUPABASE_ANON_KEY'] ||
-    '';
-  res.json({
-    url,
-    anonKey,
-    key: anonKey,
-    supabaseUrl: url,
-    supabaseAnonKey: anonKey,
-    configured: Boolean(url && anonKey),
-  });
-};
+
+// 1. Limiteur global sur toutes les routes de l'API /api/* (200 requêtes / 15 minutes par IP)
+const apiGlobalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 200,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  statusCode: 429,
+  message: {
+    error: 'Trop de requêtes envoyées depuis cette adresse IP. Veuillez patienter avant de réessayer.',
+    retryAfterMinutes: 15,
+  },
+});
+app.use('/api', apiGlobalLimiter);
+
+// 2. Limiteur strict sur les endpoints de configuration et d'authentification (40 requêtes / 15 minutes)
+const authSyncLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 40,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  statusCode: 429,
+  message: {
+    error: 'Trop de requêtes sur les services d’authentification. Veuillez patienter quelques instants.',
+    retryAfterMinutes: 15,
+  },
+});
+app.use(['/api/auth/sync-role', '/api/supabase-config', '/api/config'], authSyncLimiter);
+
+// 3. Limiteur renforcé sur les opérations d'écriture et de mutation (POST, PUT, PATCH, DELETE)
+// Prévient l'inondation de la base de données, la création massive de comptes ou de transactions (100 mutations / 15 minutes)
+const mutationsLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 100,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  statusCode: 429,
+  message: {
+    error: 'Limite de modifications ou d’enregistrements atteinte pour cette période. Veuillez patienter avant de renouveler.',
+    retryAfterMinutes: 15,
+  },
+});
+app.use(
+  [
+    '/api/system/collaborators',
+    '/api/admin/users',
+    '/api/cahier/operations',
+    '/api/cashier/transactions',
+    '/api/system/operations',
+  ],
+  (req, res, next): void => {
+    if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) {
+      mutationsLimiter(req, res, next);
+      return;
+    }
+    next();
+  }
+);
 
 app.get('/api/supabase-config', getSupabaseConfigHandler);
 app.get('/api/config', getSupabaseConfigHandler);
 
-/**
- * Helper d'initialisation du client Supabase avec privilèges d'administration.
- * STRICT : Exige obligatoirement SUPABASE_SERVICE_ROLE_KEY (pas de fallback silencieux vers la clé anonyme).
- */
-function getSupabaseAdmin() {
-  const url = process.env['SUPABASE_URL'] || '';
-  const serviceRoleKey = process.env['SUPABASE_SERVICE_ROLE_KEY'] || '';
-  if (!url || !serviceRoleKey) {
-    return null;
-  }
-  return createClient(url, serviceRoleKey, {
-    auth: {
-      autoRefreshToken: false,
-      persistSession: false,
-    },
-  });
-}
+const collaboratorCollectionAliases = ['/api/system/collaborators', '/api/admin/users'];
 
-// Configuration des administrateurs système configurés par variable d'environnement
-// Aucun email personnel n'est codé en dur dans le code source
-const getAdminEmailsFromEnv = (): string[] => {
-  return (process.env['ADMIN_EMAILS'] || '')
-    .split(',')
-    .map((e) => e.trim().toLowerCase())
-    .filter(Boolean);
-};
-
-/**
- * Fonction centrale et sécurisée de résolution de rôle serveur (RBAC).
- * SÉCURITÉ ABSOLUE : `user_metadata` est STRICTEMENT EXCLU de toute décision d'autorisation.
- * 1. Email admin déclaré dans la variable d'environnement ADMIN_EMAILS -> 'admin'
- * 2. app_metadata.role (scellé serveur par Supabase Admin) -> si différent de 'employe'
- * 3. public.profiles.role (table SQL sécurisée)
- * 4. Défaut : 'employe'
- */
-export async function resolveServerRole(
-  supabaseAdmin: SupabaseClient,
-  user: { id: string; email?: string | null; app_metadata?: Record<string, unknown> }
-): Promise<UserRole> {
-  const email = (user.email || '').toLowerCase().trim();
-  const adminEmails = getAdminEmailsFromEnv();
-  if (email && adminEmails.includes(email)) {
-    return 'admin';
-  }
-
-  const appRole = normalizeUserRole(user.app_metadata?.['role'] as string);
-  if (appRole !== 'employe') {
-    return appRole;
-  }
-
-  const { data: profile } = await supabaseAdmin
-    .from('profiles')
-    .select('role')
-    .eq('id', user.id)
-    .maybeSingle();
-
-  return profile?.role ? normalizeUserRole(profile.role) : 'employe';
-}
-
-/**
- * Middleware Express d'authentification : valide le jeton Bearer
- * via Supabase Auth admin client et attache l'utilisateur à req.user avec son rôle sécurisé.
- * SÉCURITÉ STRICTE : Ne fait JAMAIS confiance à `user_metadata` (éditable côté client par l'utilisateur).
- * Le rôle est extrait exclusivement via resolveServerRole.
- * FAIL-CLOSED : En cas d'indisponibilité du client d'administration, refuse la requête avec une erreur 500 explicite.
- */
-export async function requireAuth(req: express.Request, res: express.Response, next: express.NextFunction): Promise<void> {
-  const authHeader = req.headers.authorization;
-  const token = authHeader?.startsWith('Bearer ') ? authHeader.substring(7) : (authHeader || '').replace('Bearer ', '');
-
-  if (!token) {
-    res.status(401).json({ error: 'Jeton d’authentification manquant dans l’en-tête Authorization' });
-    return;
-  }
-
-  const supabaseAdmin = getSupabaseAdmin();
-  if (!supabaseAdmin) {
-    res.status(500).json({ error: 'Service d’authentification indisponible : configuration serveur SUPABASE_SERVICE_ROLE_KEY manquante' });
-    return;
-  }
-
-  try {
-    const { data, error } = await supabaseAdmin.auth.getUser(token);
-    if (error || !data.user) {
-      res.status(401).json({ error: 'Jeton d’authentification invalide ou expiré' });
-      return;
-    }
-
-    const user = data.user;
-    const resolvedRole = await resolveServerRole(supabaseAdmin, user);
-
-    (req as unknown as Record<string, unknown>)['user'] = {
-      id: user.id,
-      email: user.email,
-      role: resolvedRole,
-      app_metadata: user.app_metadata,
-      user_metadata: user.user_metadata,
-    };
-
-    next();
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : 'Échec de la validation de session';
-    res.status(401).json({ error: message });
-  }
-}
-
-/**
- * Middleware de contrôle d'accès basé sur les rôles (RBAC).
- * Exige que le rôle résolu de l'utilisateur fasse partie des rôles autorisés.
- * Le rôle 'tresorier' hérite des mêmes autorisations que 'manager'.
- */
-export function requireRole(allowedRoles: UserRole[]) {
-  return (req: express.Request, res: express.Response, next: express.NextFunction): void => {
-    const user = (req as unknown as Record<string, unknown>)['user'] as { role?: UserRole; email?: string } | undefined;
-    const userRole = user?.role;
-    const isAllowed = userRole && (
-      allowedRoles.includes(userRole) ||
-      (userRole === 'tresorier' && allowedRoles.includes('manager'))
-    );
-    if (!isAllowed) {
-      res.status(403).json({ error: 'Accès refusé. Privilèges insuffisants pour exécuter cette opération.' });
-      return;
-    }
-    next();
-  };
-}
-
-/**
- * 4. Le "Garde-Fou" Ultime : La Validation Côté Serveur (RBAC Niveau 4)
- * Valide le JWT et vérifie le statut admin via resolveServerRole.
- * Auto-réparation immédiate : si l'utilisateur est légitime mais que son app_metadata
- * n'a pas encore été synchronisé, le serveur scelle son app_metadata et synchronise public.profiles.
- */
-export async function requireAdmin(req: express.Request, res: express.Response, next: express.NextFunction): Promise<void> {
-  const authHeader = req.headers.authorization;
-  const token = authHeader?.startsWith('Bearer ') ? authHeader.substring(7) : (authHeader || '').replace('Bearer ', '');
-
-  if (!token) {
-    res.status(401).json({ error: 'Accès non autorisé. Jeton de sécurité requis.' });
-    return;
-  }
-
-  const supabaseAdmin = getSupabaseAdmin();
-  if (!supabaseAdmin) {
-    res.status(500).json({ error: 'Service d’administration indisponible : configuration serveur manquante' });
-    return;
-  }
-
-  try {
-    const { data: authData, error: authError } = await supabaseAdmin.auth.getUser(token);
-    const user = authData?.user;
-
-    if (authError || !user) {
-      res.status(401).json({ error: 'Session invalide ou expirée' });
-      return;
-    }
-
-    const resolvedRole = await resolveServerRole(supabaseAdmin, user);
-    if (resolvedRole !== 'admin') {
-      res.status(403).json({
-        error: `Accès refusé. Cette opération exige les privilèges administrateur (connecté en tant que: ${user.email || 'anonyme'}).`,
-      });
-      return;
-    }
-
-    const appRole = normalizeUserRole(user.app_metadata?.['role'] as string);
-    // Auto-réparation si app_metadata n'est pas encore synchronisé (uniquement pour un admin authentifié et légitime)
-    if (appRole !== 'admin') {
-      try {
-        await supabaseAdmin.auth.admin.updateUserById(user.id, {
-          app_metadata: { ...user.app_metadata, role: 'admin' },
-        });
-        await supabaseAdmin.from('profiles').upsert(
-          {
-            id: user.id,
-            email: user.email,
-            role: 'admin',
-            updated_at: new Date().toISOString(),
-          },
-          { onConflict: 'id' }
-        );
-      } catch (syncErr) {
-        console.warn('Auto-réparation du rôle admin (non-bloquante) :', syncErr);
-      }
-    }
-
-    (req as unknown as Record<string, unknown>)['user'] = {
-      id: user.id,
-      email: user.email,
-      role: 'admin',
-      app_metadata: { ...user.app_metadata, role: 'admin' },
-      user_metadata: user.user_metadata,
-    };
-
-    next();
-  } catch {
-    res.status(403).json({ error: 'Accès refusé. Rôle administrateur requis.' });
-  }
-}
-
-/**
- * Récupération sécurisée de la liste des collaborateurs.
- * Réservé aux administrateurs (protégé par le middleware requireAdmin).
- */
-const getCollaboratorsHandler = async (_req: express.Request, res: express.Response): Promise<void> => {
-  const adminClient = getSupabaseAdmin();
-
-  if (!adminClient) {
-    res.status(503).json({ error: 'Service d’administration indisponible : SUPABASE_SERVICE_ROLE_KEY non configurée' });
-    return;
-  }
-
-  try {
-    // 1. Récupérer tous les utilisateurs depuis Supabase Auth
-    let authUsers: {
-      id: string;
-      email?: string;
-      phone?: string;
-      created_at?: string;
-      last_sign_in_at?: string;
-      updated_at?: string;
-      user_metadata?: Record<string, unknown>;
-      app_metadata?: Record<string, unknown>;
-    }[] = [];
-    try {
-      const { data: authData, error: authErr } = await adminClient.auth.admin.listUsers();
-      if (!authErr && authData?.users) {
-        authUsers = authData.users as typeof authUsers;
-      }
-    } catch {
-      // Si la liste d'auth échoue, on continue avec profiles
-    }
-
-    // 2. Récupérer tous les profils de la table public.profiles
-    const { data: profiles } = await adminClient
-      .from('profiles')
-      .select('*');
-
-    const profileMap = new Map((profiles || []).map((p) => [p.id, p]));
-    const processedIds = new Set<string>();
-
-    const users: Record<string, unknown>[] = [];
-
-    // Combiner les utilisateurs Auth
-    for (const u of authUsers) {
-      processedIds.add(u.id);
-      const p = profileMap.get(u.id);
-
-      const firstName = p?.first_name || (u.user_metadata?.['first_name'] as string) || (u.user_metadata?.['firstName'] as string) || '';
-      const lastName = p?.last_name || (u.user_metadata?.['last_name'] as string) || (u.user_metadata?.['lastName'] as string) || '';
-      const email = u.email || p?.email || '';
-      const displayName = `${firstName} ${lastName}`.trim() || (u.user_metadata?.['display_name'] as string) || email || 'Utilisateur';
-      const rawRole = (u.app_metadata?.['role'] as string) || p?.role || (u.user_metadata?.['role'] as string) || 'employe';
-      const role = normalizeUserRole(rawRole);
-
-      users.push({
-        id: u.id,
-        email,
-        firstName,
-        lastName,
-        displayName,
-        role,
-        department: p?.department || 'Services Généraux',
-        phone: p?.phone || u.phone || '',
-        isActive: p?.is_active ?? true,
-        avatarUrl: p?.avatar_url,
-        createdAt: p?.created_at || u.created_at || new Date().toISOString(),
-        lastLoginAt: u.last_sign_in_at || p?.last_login_at,
-        updatedAt: p?.updated_at || u.updated_at,
-      });
-    }
-
-    // Ajouter les profils qui ne seraient pas dans authUsers
-    for (const p of (profiles || [])) {
-      if (!processedIds.has(p.id)) {
-        processedIds.add(p.id);
-        users.push({
-          id: p.id,
-          email: p.email || '',
-          firstName: p.first_name || '',
-          lastName: p.last_name || '',
-          displayName: `${p.first_name || ''} ${p.last_name || ''}`.trim() || p.email || 'Utilisateur',
-          role: normalizeUserRole(p.role),
-          department: p.department || 'Services Généraux',
-          phone: p.phone || '',
-          isActive: p.is_active ?? true,
-          avatarUrl: p.avatar_url,
-          createdAt: p.created_at || new Date().toISOString(),
-          updatedAt: p.updated_at,
-        });
-      }
-    }
-
-    res.json({ users });
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : 'Erreur interne du serveur';
-    res.status(500).json({ error: message });
-  }
-};
-
-app.get('/api/system/collaborators', requireAdmin, getCollaboratorsHandler);
-app.get('/api/admin/users', requireAdmin, getCollaboratorsHandler);
+collaboratorCollectionAliases.forEach((path) => {
+  app.get(path, requireAdmin, getCollaboratorsHandler);
+});
 
 /**
  * Endpoint de synchronisation et de restauration automatique du rôle.
@@ -402,276 +186,30 @@ app.post('/api/auth/sync-role', requireAuth, async (req: express.Request, res: e
       email: user.email,
     });
   } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : 'Erreur lors de la synchronisation du rôle';
-    res.status(500).json({ error: message });
+    console.error('Erreur lors de la synchronisation du rôle:', err);
+    res.status(500).json({ error: 'Erreur interne lors de la synchronisation du rôle.' });
   }
 });
 
-/**
- * Endpoint sécurisé de création de collaborateurs.
- * Réservé aux administrateurs (protégé par le middleware requireAdmin) :
- * applique la séparation étanche app_metadata (rôle inviolable) vs user_metadata.
- */
-const createCollaboratorHandler = async (req: express.Request, res: express.Response): Promise<void> => {
-  const {
-    email,
-    password,
-    firstName,
-    lastName,
-    displayName,
-    role,
-    department,
-    phone,
-    isActive,
-    sites,
-  } = req.body;
-
-  if (!email || !password) {
-    res.status(400).json({ error: 'Email et mot de passe initial obligatoires' });
-    return;
-  }
-
-  // Vérification de robustesse minimale du mot de passe initial
-  if (typeof password !== 'string' || password.length < 8) {
-    res.status(400).json({ error: 'Le mot de passe initial doit comporter au moins 8 caractères' });
-    return;
-  }
-  const hasLetter = /[a-zA-Z]/.test(password);
-  const hasDigit = /[0-9]/.test(password);
-  if (!hasLetter || !hasDigit) {
-    res.status(400).json({ error: 'Le mot de passe initial doit comporter au moins une lettre et un chiffre' });
-    return;
-  }
-
-  const validRoles: UserRole[] = ['admin', 'manager', 'tresorier', 'caissiere', 'comptable', 'employe'];
-  if (!role || !validRoles.includes(role)) {
-    res.status(400).json({ error: 'Le rôle Transmex est obligatoire et doit être défini explicitement (admin, manager, tresorier, caissiere, comptable, employe)' });
-    return;
-  }
-
-  const adminClient = getSupabaseAdmin();
-
-  if (!adminClient) {
-    res.status(503).json({ error: 'Service d’administration indisponible : SUPABASE_SERVICE_ROLE_KEY non configurée' });
-    return;
-  }
-
-  try {
-    const computedDisplayName = displayName || `${firstName || ''} ${lastName || ''}`.trim() || email;
-    const computedRole = normalizeUserRole(role);
-    const sitesList = Array.isArray(sites) ? sites : (department ? [department] : []);
-
-    // 2. Création avec privilèges élevés et étanchéité des métadonnées
-    const { data: adminAuthData, error: adminAuthError } = await adminClient.auth.admin.createUser({
-      email,
-      password,
-      email_confirm: true,
-      app_metadata: {
-        role: computedRole,
-        assignedSiteNames: sitesList,
-      },
-      user_metadata: {
-        display_name: computedDisplayName,
-        first_name: firstName || '',
-        last_name: lastName || '',
-        phone: phone || '',
-      },
-    });
-
-    if (adminAuthError) {
-      res.status(400).json({ error: adminAuthError.message });
-      return;
-    }
-    const authUserId = adminAuthData.user.id;
-
-    // 3. Synchronisation avec la table public.profiles (avec onConflict: 'id' pour gérer les triggers Supabase automatiques)
-    const profilePayload = {
-      id: authUserId,
-      email,
-      first_name: firstName || '',
-      last_name: lastName || '',
-      role: computedRole,
-      department: department || 'Direction Générale',
-      phone: phone || '',
-      is_active: isActive !== undefined ? isActive : true,
-      updated_at: new Date().toISOString(),
-    };
-
-    const { error: profileError } = await adminClient
-      .from('profiles')
-      .upsert(profilePayload, { onConflict: 'id' });
-
-    if (profileError) {
-      console.error('Échec synchronisation profiles:', profileError.message);
-      res.status(207).json({
-        user: {
-          id: authUserId,
-          email,
-          firstName: firstName || '',
-          lastName: lastName || '',
-          displayName: computedDisplayName,
-          role: computedRole,
-          department: department || 'Direction Générale',
-          phone: phone || '',
-          isActive: isActive !== undefined ? isActive : true,
-          createdAt: new Date().toISOString(),
-        },
-        warning: `Compte Auth créé mais la synchronisation du profil public a rencontré une erreur: ${profileError.message}`,
-      });
-      return;
-    }
-
-    res.status(201).json({
-      user: {
-        id: authUserId,
-        email,
-        firstName: firstName || '',
-        lastName: lastName || '',
-        displayName: computedDisplayName,
-        role: computedRole,
-        department: department || 'Direction Générale',
-        phone: phone || '',
-        isActive: isActive !== undefined ? isActive : true,
-        createdAt: new Date().toISOString(),
-      },
-      message: 'Collaborateur créé avec succès (droits scellés dans app_metadata et synchronisés)',
-    });
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : 'Erreur interne du serveur';
-    res.status(500).json({ error: message });
-  }
-};
-
-app.post('/api/system/collaborators', requireAdmin, createCollaboratorHandler);
-app.post('/api/admin/users', requireAdmin, createCollaboratorHandler);
+collaboratorCollectionAliases.forEach((path) => {
+  app.post(path, requireAdmin, createCollaboratorHandler);
+});
 
 /**
  * Modification d'un compte collaborateur (synchronisation auth.app_metadata + public.profiles)
  */
-const updateCollaboratorHandler = async (req: express.Request, res: express.Response): Promise<void> => {
-  const rawUserId = req.params['id'];
-  const userId = Array.isArray(rawUserId) ? rawUserId[0] : rawUserId;
-  if (!userId) {
-    res.status(400).json({ error: 'Identifiant collaborateur requis' });
-    return;
-  }
+app.patch('/api/profile/me', requireAuth, updateCurrentUserProfileHandler);
 
-  const { firstName, lastName, role, department, phone, isActive } = req.body;
-  const adminClient = getSupabaseAdmin();
-
-  if (!adminClient) {
-    res.status(503).json({ error: 'Service d’administration indisponible : SUPABASE_SERVICE_ROLE_KEY non configurée' });
-    return;
-  }
-
-  try {
-    // 1. Récupération préalable de l'utilisateur auth pour garantir la présence de l'email si besoin d'upsert
-    let userEmail: string | undefined;
-    const { data: authUserData } = await adminClient.auth.admin.getUserById(userId);
-    if (authUserData?.user?.email) {
-      userEmail = authUserData.user.email;
-    }
-
-    const profileUpdates: Record<string, unknown> = {
-      id: userId,
-      updated_at: new Date().toISOString(),
-    };
-    if (userEmail) profileUpdates['email'] = userEmail;
-    if (firstName !== undefined) profileUpdates['first_name'] = firstName;
-    if (lastName !== undefined) profileUpdates['last_name'] = lastName;
-    if (role !== undefined) profileUpdates['role'] = normalizeUserRole(role);
-    if (department !== undefined) profileUpdates['department'] = department;
-    if (phone !== undefined) profileUpdates['phone'] = phone;
-    if (isActive !== undefined) profileUpdates['is_active'] = isActive;
-
-    const { error: profileUpdateError } = await adminClient
-      .from('profiles')
-      .upsert(profileUpdates, { onConflict: 'id' });
-
-    if (profileUpdateError) {
-      console.error('Échec de la mise à jour public.profiles:', profileUpdateError.message);
-      res.status(500).json({ error: `Erreur mise à jour profil: ${profileUpdateError.message}` });
-      return;
-    }
-
-    const authUpdates: Record<string, unknown> = {};
-    if (role !== undefined) {
-      authUpdates['app_metadata'] = { role: normalizeUserRole(role) };
-    }
-    if (firstName !== undefined || lastName !== undefined) {
-      authUpdates['user_metadata'] = {
-        first_name: firstName,
-        last_name: lastName,
-        display_name: `${firstName || ''} ${lastName || ''}`.trim(),
-      };
-    }
-    if (Object.keys(authUpdates).length > 0) {
-      const { error: authUpdateError } = await adminClient.auth.admin.updateUserById(userId, authUpdates);
-      if (authUpdateError) {
-        console.error('Échec mise à jour auth.users:', authUpdateError.message);
-        res.status(500).json({ error: `Erreur mise à jour auth: ${authUpdateError.message}` });
-        return;
-      }
-    }
-
-    res.json({ success: true, message: 'Collaborateur mis à jour avec succès' });
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : 'Erreur lors de la mise à jour';
-    res.status(500).json({ error: message });
-  }
-};
-
-app.patch('/api/system/collaborators/:id', requireAdmin, updateCollaboratorHandler);
-app.patch('/api/admin/users/:id', requireAdmin, updateCollaboratorHandler);
+collaboratorCollectionAliases.forEach((path) => {
+  app.patch(`${path}/:id`, requireAdmin, updateCollaboratorHandler);
+});
 
 /**
  * Suppression d'un compte collaborateur (auth.users + public.profiles).
  */
-const deleteCollaboratorHandler = async (req: express.Request, res: express.Response): Promise<void> => {
-  const rawUserId = req.params['id'];
-  const userId = Array.isArray(rawUserId) ? rawUserId[0] : rawUserId;
-  if (!userId) {
-    res.status(400).json({ error: 'Identifiant collaborateur requis' });
-    return;
-  }
-
-  // Protection anti-auto-suppression
-  const currentAdminUser = (req as unknown as Record<string, unknown>)['user'] as { id?: string; email?: string } | undefined;
-  if (currentAdminUser?.id && currentAdminUser.id === userId) {
-    res.status(400).json({ error: 'Action refusée : vous ne pouvez pas supprimer votre propre compte administrateur.' });
-    return;
-  }
-
-  const adminClient = getSupabaseAdmin();
-  if (!adminClient) {
-    res.status(503).json({ error: 'Service d’administration indisponible : SUPABASE_SERVICE_ROLE_KEY non configurée' });
-    return;
-  }
-
-  try {
-    const { error: authDeleteError } = await adminClient.auth.admin.deleteUser(userId);
-    if (authDeleteError) {
-      console.error('Échec suppression auth.users:', authDeleteError.message);
-      res.status(500).json({ error: `Erreur suppression auth: ${authDeleteError.message}` });
-      return;
-    }
-
-    const { error: profileDeleteError } = await adminClient.from('profiles').delete().eq('id', userId);
-    if (profileDeleteError) {
-      console.error('Échec suppression public.profiles:', profileDeleteError.message);
-      res.status(500).json({ error: `Erreur suppression profil: ${profileDeleteError.message}` });
-      return;
-    }
-
-    res.json({ success: true, message: 'Compte collaborateur supprimé avec succès' });
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : 'Erreur lors de la suppression';
-    res.status(500).json({ error: message });
-  }
-};
-
-app.delete('/api/system/collaborators/:id', requireAdmin, deleteCollaboratorHandler);
-app.delete('/api/admin/users/:id', requireAdmin, deleteCollaboratorHandler);
+collaboratorCollectionAliases.forEach((path) => {
+  app.delete(`${path}/:id`, requireAdmin, deleteCollaboratorHandler);
+});
 
 /**
  * ─────────────────────────────────────────────────────────────────────────────
@@ -680,107 +218,78 @@ app.delete('/api/admin/users/:id', requireAdmin, deleteCollaboratorHandler);
  * Toutes les écritures et consultations prioritaires passent par ces routes.
  * Elles effectuent la validation des données, contrôlent les droits et interagissent
  * avec PostgreSQL via Supabase Admin avec la clé de service.
+ * Les pièces comptables au format CSH1/YYYY/00000 sont attribuées une seule fois de manière
+ * déterministe à l'insertion et directement servies sans recalcul complet de table.
  */
+
+interface DuplicateCandidateRow {
+  id: string;
+  date: string;
+  libelle: string;
+  montant: number;
+  service?: string | null;
+  no_dossier?: string | null;
+}
 
 /**
- * Enrichit les opérations de caisse avec leur numéro de pièce comptable séquentiel CSH1/AAAA/XXXXX
- * basé sur l'ordre chronologique d'enregistrement par exercice comptable.
+ * Vérifie si une transaction de caisse identique existe déjà en base de données.
+ * Critères d'unicité stricts : Date (jour) + Montant + Libellé + N° de dossier/matricule + Service.
+ * Bloque universellement la double saisie (que l'auteur soit le même caissier ou un autre).
  */
-const attachPiecesComptables = async (
-  client: NonNullable<ReturnType<typeof getSupabaseAdmin>>,
-  rows: Record<string, unknown>[]
-): Promise<Record<string, unknown>[]> => {
-  if (!rows || rows.length === 0) return rows;
-  try {
-    const { data: allSeqRows } = await client
-      .from('cashier_transactions')
-      .select('id, date, created_at')
-      .order('date', { ascending: true })
-      .order('created_at', { ascending: true });
-
-    const pieceMap = new Map<string, string>();
-    if (allSeqRows && Array.isArray(allSeqRows)) {
-      const yearCounters: Record<string, number> = {};
-      for (const r of allSeqRows) {
-        const rawYear = r.date ? new Date(r.date).getFullYear() : 2026;
-        const year = isNaN(rawYear) ? 2026 : rawYear;
-        yearCounters[year] = (yearCounters[year] || 0) + 1;
-        const seq = String(yearCounters[year]).padStart(5, '0');
-        pieceMap.set(r.id, `CSH1/${year}/${seq}`);
-      }
-    }
-
-    return rows.map((row) => {
-      const rowId = typeof row['id'] === 'string' ? row['id'] : String(row['id'] || '');
-      const rawDate = row['date'];
-      const dateVal = typeof rawDate === 'string' || typeof rawDate === 'number' ? rawDate : Date.now();
-      const fallbackYear = new Date(dateVal).getFullYear() || 2026;
-      return {
-        ...row,
-        piece_comptable: pieceMap.get(rowId) || `CSH1/${fallbackYear}/00001`,
-      };
-    });
-  } catch (e) {
-    console.warn('Impossible de calculer la séquence de pièces comptables:', e);
-    return rows;
+const checkDuplicateCashierTransaction = async (
+  adminClient: SupabaseClient,
+  candidate: {
+    idToExclude?: string;
+    date: string;
+    montant: number;
+    libelle: string;
+    noDossier?: string | null;
+    service?: string | null;
   }
-};
+): Promise<{ isDuplicate: boolean; existing?: DuplicateCandidateRow }> => {
+  const normDay = normalizeDateToDay(candidate.date);
+  const normLibelle = candidate.libelle.toLowerCase().trim().replace(/\s+/g, ' ');
+  const normNoDossier = (candidate.noDossier || '').toLowerCase().trim().replace(/\s+/g, ' ');
+  const normService = (candidate.service || '').toLowerCase().trim().replace(/\s+/g, ' ');
 
-/**
- * Récupération des opérations de caisse (GET /api/cahier/operations & /api/cashier/transactions)
- * Supporte la pagination optionnelle via limit/offset (défaut limit: 100, max: 1000) pour préserver les ressources.
- */
-const getOperationsHandler = async (req: express.Request, res: express.Response): Promise<void> => {
-  const adminClient = getSupabaseAdmin();
-  if (!adminClient) {
-    res.status(503).json({ error: 'Service Supabase non configuré sur le serveur' });
-    return;
+  const absMontant = Math.abs(Number(candidate.montant));
+
+  // Requête large sur le montant (positif ou négatif) pour neutraliser toute incohérence de signe
+  const { data: candidates, error } = await adminClient
+    .from('cashier_transactions')
+    .select('id, date, libelle, montant, service, no_dossier')
+    .or(`montant.eq.${candidate.montant},montant.eq.${-candidate.montant},montant.eq.${absMontant},montant.eq.${-absMontant}`);
+
+  if (error || !candidates || candidates.length === 0) {
+    return { isDuplicate: false };
   }
 
-  try {
-    const rawLimit = req.query['limit'];
-    const rawOffset = req.query['offset'];
-
-    let limit = rawLimit ? Number(rawLimit) : 100;
-    if (isNaN(limit) || limit <= 0) {
-      limit = 100;
-    }
-    // Plafond de sécurité pour empêcher la saturation mémoire
-    if (limit > 1000) {
-      limit = 1000;
+  const rows = candidates as unknown as DuplicateCandidateRow[];
+  const duplicate = rows.find((c: DuplicateCandidateRow) => {
+    if (candidate.idToExclude && c.id === candidate.idToExclude) {
+      return false;
     }
 
-    let offset = rawOffset ? Number(rawOffset) : 0;
-    if (isNaN(offset) || offset < 0) {
-      offset = 0;
-    }
+    const cDay = normalizeDateToDay(c.date);
+    if (cDay !== normDay) return false;
 
-    const { data, error, count } = await adminClient
-      .from('cashier_transactions')
-      .select('id, date, libelle, service, type_description, category, status, no_dossier, dossier_id, first_name, partenaire, employee, quantity, montant, solde_apres, selected, created_at, updated_at', { count: 'exact' })
-      .order('date', { ascending: false })
-      .order('created_at', { ascending: false })
-      .range(offset, offset + limit - 1);
+    // Comparaison du montant en valeur absolue arrondie
+    const cAbs = Math.abs(Number(c.montant));
+    if (Math.round(cAbs * 100) !== Math.round(absMontant * 100)) return false;
 
-    if (error) {
-      console.error('Erreur SQL lors de la lecture des opérations:', error.message);
-      res.status(500).json({ error: error.message });
-      return;
-    }
+    const cLib = String(c.libelle || '').toLowerCase().trim().replace(/\s+/g, ' ');
+    if (cLib !== normLibelle) return false;
 
-    const enrichedRows = await attachPiecesComptables(adminClient, data || []);
+    const cDos = String(c.no_dossier || '').toLowerCase().trim().replace(/\s+/g, ' ');
+    if (cDos !== normNoDossier) return false;
 
-    res.json({
-      operations: enrichedRows,
-      transactions: enrichedRows,
-      total: count ?? (data?.length || 0),
-      limit,
-      offset,
-    });
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : 'Erreur interne lors de la récupération des opérations';
-    res.status(500).json({ error: message });
-  }
+    const cSrv = String(c.service || '').toLowerCase().trim().replace(/\s+/g, ' ');
+    if (cSrv !== normService) return false;
+
+    return true;
+  });
+
+  return { isDuplicate: !!duplicate, existing: duplicate };
 };
 
 /**
@@ -799,6 +308,10 @@ const saveOperationHandler = async (req: express.Request, res: express.Response)
     const callerId: string | null = authenticatedUser?.id || null;
 
     const payload = req.body || {};
+    const rawPiece = payload.pieceComptable || payload.piece_comptable;
+    const candidatePiece = typeof rawPiece === 'string' && rawPiece.trim()
+      ? rawPiece.trim().toUpperCase().replace(/\s+/g, '')
+      : null;
     const libelle = typeof payload.libelle === 'string' ? payload.libelle.trim() : '';
     const service = payload.service || payload.typeTransaction || payload.type_transaction || null;
     const typeDescription = payload.typeDescription || payload.type_description || null;
@@ -808,7 +321,7 @@ const saveOperationHandler = async (req: express.Request, res: express.Response)
     const partenaire = payload.partenaire !== undefined ? payload.partenaire : null;
     const employee = payload.employee !== undefined ? payload.employee : null;
     const quantity = payload.quantity !== undefined && payload.quantity !== null ? Number(payload.quantity) : (service === 'Opérations' ? 1 : null);
-    const montant = Number(payload.montant);
+    let montant = Number(payload.montant);
 
     if (!libelle) {
       res.status(400).json({ error: 'Le libellé de l’opération est obligatoire.' });
@@ -817,6 +330,49 @@ const saveOperationHandler = async (req: express.Request, res: express.Response)
 
     if (isNaN(montant)) {
       res.status(400).json({ error: 'Le montant de l’opération doit être un nombre valide.' });
+      return;
+    }
+
+    // Contrôle d'unicité strict du numéro de pièce comptable en priorité absolue
+    if (candidatePiece) {
+      const { data: pieceDup } = await adminClient
+        .from('cashier_transactions')
+        .select('id, piece_comptable, date, libelle')
+        .eq('piece_comptable', candidatePiece)
+        .maybeSingle();
+
+      if (pieceDup) {
+        res.status(409).json({
+          error: `Erreur d'unicité : le numéro de pièce comptable "${candidatePiece}" est déjà attribué à une autre opération (ID: ${pieceDup.id}, Libellé: "${pieceDup.libelle}"). Les numéros de pièce comptable doivent être strictement uniques.`,
+        });
+        return;
+      }
+    }
+
+    // Normalisation absolue du signe du montant selon la catégorie
+    if (category === 'sortie' && montant > 0) {
+      montant = -montant;
+    } else if (category === 'entree' && montant < 0) {
+      montant = Math.abs(montant);
+    }
+
+    const dateToStore = normalizeDateToDay(payload.date) || new Date().toISOString().slice(0, 10);
+
+    // Contrôle d'unicité strict côté serveur : Date + Montant + Libellé + N° de dossier/matricule + Service
+    const duplicateCheck = await checkDuplicateCashierTransaction(adminClient, {
+      date: dateToStore,
+      montant,
+      libelle,
+      noDossier,
+      service,
+    });
+
+    if (duplicateCheck.isDuplicate && duplicateCheck.existing) {
+      const dup = duplicateCheck.existing;
+      const dupMontantFmt = Math.abs(Number(dup.montant)).toLocaleString('fr-FR');
+      res.status(409).json({
+        error: `Opération déjà enregistrée : une opération identique existe déjà en caisse (Date: ${dup.date}, Montant: ${dupMontantFmt} FCFA, Service: ${dup.service || 'N/A'}, Libellé: "${dup.libelle}"). La double saisie est interdite.`,
+      });
       return;
     }
 
@@ -838,7 +394,14 @@ const saveOperationHandler = async (req: express.Request, res: express.Response)
 
     const status = payload.status === 'posted' ? 'posted' : (payload.status === 'cancelled' ? 'cancelled' : 'draft');
 
+    // Si aucune pièce comptable n'est fournie explicitement (saisie manuelle/import), on laisse `null` :
+    // le déclencheur PostgreSQL `assign_piece_comptable` (voir supabase/migrations/202609201200_...)
+    // assigne alors le numéro de façon atomique (verrouillage de ligne sur le compteur de l'année),
+    // ce qu'un calcul "SELECT max()+1" en Node.js ne peut pas garantir sous concurrence.
+    const finalPieceComptable = candidatePiece || null;
+
     const rowToInsert = {
+      piece_comptable: finalPieceComptable,
       libelle,
       service,
       type_description: typeDescription,
@@ -853,10 +416,8 @@ const saveOperationHandler = async (req: express.Request, res: express.Response)
       created_by: callerId,
       quantity,
       montant,
-      date: payload.date ? (typeof payload.date === 'string' ? payload.date : new Date(payload.date).toISOString()) : new Date().toISOString(),
+      date: dateToStore,
     };
-
-    console.log(`[AUDIT CASHIER] Création opération par [${authenticatedUser?.email || callerId || 'inconnu'}] (rôle: ${authenticatedUser?.role || 'non-défini'}) : Montant=${montant}, Libellé="${libelle}"`);
 
     const { data, error } = await adminClient
       .from('cashier_transactions')
@@ -865,22 +426,39 @@ const saveOperationHandler = async (req: express.Request, res: express.Response)
       .single();
 
     if (error) {
-      console.error('Erreur SQL lors de l’insertion de l’opération:', error.message);
-      res.status(500).json({ error: error.message });
+      console.error('Erreur SQL lors de l’insertion de l’opération:', error.message, error.details, error.hint);
+      const isUniqueViolation = error.code === '23505' || error.message?.toLowerCase().includes('unique') || error.message?.includes('duplicate key');
+      if (isUniqueViolation) {
+        const detailMsg = error.details || error.message || '';
+        res.status(409).json({
+          error: `Erreur d'unicité : ${detailMsg.includes('piece_comptable') ? 'le numéro de pièce comptable est déjà utilisé' : 'une valeur unique est en doublon'} dans la base de données (${detailMsg || 'conflit d’unicité SQL'}).`,
+        });
+        return;
+      }
+      res.status(500).json({ error: `Erreur lors de l’enregistrement de l’opération : ${error.message || 'erreur base de données'}` });
       return;
     }
 
-    const [enrichedOperation] = await attachPiecesComptables(adminClient, [data]);
+    await writeAuditLog(adminClient, {
+      userId: callerId,
+      userEmail: authenticatedUser?.email,
+      userRole: authenticatedUser?.role,
+      action: 'CREATE_OPERATION',
+      entityId: data?.id ?? null,
+      details: { montant, libelle, piece_comptable: data?.piece_comptable ?? finalPieceComptable },
+    });
+
+    const enrichedOperation = formatPersistedPieceComptable(data);
 
     res.status(201).json({
       success: true,
-      operation: enrichedOperation || data,
-      transaction: enrichedOperation || data,
+      operation: enrichedOperation,
+      transaction: enrichedOperation,
       message: 'Opération enregistrée avec succès',
     });
   } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : 'Erreur interne lors de la sauvegarde';
-    res.status(500).json({ error: message });
+    console.error('Erreur saveOperationHandler:', err);
+    res.status(500).json({ error: 'Erreur interne lors de la sauvegarde de l’opération.' });
   }
 };
 
@@ -919,7 +497,8 @@ const updateOperationHandler = async (req: express.Request, res: express.Respons
         .maybeSingle();
 
       if (fetchError) {
-        res.status(500).json({ error: `Erreur lors de la vérification des droits: ${fetchError.message}` });
+        console.error('Erreur vérification droits updateOperationHandler:', fetchError.message);
+        res.status(500).json({ error: 'Erreur lors de la vérification des autorisations sur l’opération.' });
         return;
       }
       if (!existingRow) {
@@ -1023,7 +602,31 @@ const updateOperationHandler = async (req: express.Request, res: express.Respons
     }
 
     if (payload.date !== undefined && payload.date) {
-      updateData['date'] = typeof payload.date === 'string' ? payload.date : new Date(payload.date).toISOString();
+      updateData['date'] = normalizeDateToDay(payload.date) || new Date().toISOString().slice(0, 10);
+    }
+
+    if (payload.pieceComptable !== undefined || payload.piece_comptable !== undefined) {
+      const rawPiece = payload.pieceComptable ?? payload.piece_comptable;
+      const targetPiece = typeof rawPiece === 'string' && rawPiece.trim()
+        ? rawPiece.trim().toUpperCase().replace(/\s+/g, '')
+        : null;
+
+      if (targetPiece) {
+        const { data: pieceDup } = await adminClient
+          .from('cashier_transactions')
+          .select('id, piece_comptable, date, libelle')
+          .eq('piece_comptable', targetPiece)
+          .neq('id', targetId)
+          .maybeSingle();
+
+        if (pieceDup) {
+          res.status(409).json({
+            error: `Modification refusée : le numéro de pièce comptable "${targetPiece}" est déjà attribué à une autre opération (ID: ${pieceDup.id}, Libellé: "${pieceDup.libelle}").`,
+          });
+          return;
+        }
+      }
+      updateData['piece_comptable'] = targetPiece;
     }
 
     if (Object.keys(updateData).length === 0) {
@@ -1031,9 +634,42 @@ const updateOperationHandler = async (req: express.Request, res: express.Respons
       return;
     }
 
-    updateData['updated_at'] = new Date().toISOString();
+    // Contrôle anti-doublon si un des champs de l'empreinte change
+    if (
+      updateData['montant'] !== undefined ||
+      updateData['libelle'] !== undefined ||
+      updateData['date'] !== undefined ||
+      updateData['service'] !== undefined ||
+      updateData['no_dossier'] !== undefined
+    ) {
+      const { data: currentRecord } = await adminClient
+        .from('cashier_transactions')
+        .select('id, date, libelle, montant, service, no_dossier')
+        .eq('id', targetId)
+        .maybeSingle();
 
-    console.log(`[AUDIT CASHIER] Modification opération [${targetId}] par [${authenticatedUser?.email || authenticatedUser?.id || 'inconnu'}] (rôle: ${authenticatedUser?.role || 'non-défini'}) :`, Object.keys(updateData));
+      if (currentRecord) {
+        const checkCandidate = {
+          idToExclude: targetId,
+          date: (updateData['date'] as string) || currentRecord.date || new Date().toISOString(),
+          montant: updateData['montant'] !== undefined ? (updateData['montant'] as number) : Number(currentRecord.montant),
+          libelle: (updateData['libelle'] as string) || currentRecord.libelle || '',
+          noDossier: updateData['no_dossier'] !== undefined ? (updateData['no_dossier'] as string) : currentRecord.no_dossier,
+          service: updateData['service'] !== undefined ? (updateData['service'] as string) : currentRecord.service,
+        };
+
+        const updateDup = await checkDuplicateCashierTransaction(adminClient, checkCandidate);
+        if (updateDup.isDuplicate && updateDup.existing) {
+          const dup = updateDup.existing;
+          res.status(409).json({
+            error: `Modification refusée : une opération identique existe déjà en caisse (Date: ${dup.date}, Montant: ${dup.montant} FCFA, Service: ${dup.service || 'N/A'}, Libellé: "${dup.libelle}").`,
+          });
+          return;
+        }
+      }
+    }
+
+    updateData['updated_at'] = new Date().toISOString();
 
     const { data, error } = await adminClient
       .from('cashier_transactions')
@@ -1043,22 +679,39 @@ const updateOperationHandler = async (req: express.Request, res: express.Respons
       .single();
 
     if (error) {
-      console.error('Erreur SQL lors de la mise à jour de l’opération:', error.message);
-      res.status(500).json({ error: error.message });
+      console.error('Erreur SQL lors de la mise à jour de l’opération:', error.message, error.details, error.hint);
+      const isUniqueViolation = error.code === '23505' || error.message?.toLowerCase().includes('unique') || error.message?.includes('duplicate key');
+      if (isUniqueViolation) {
+        const detailMsg = error.details || error.message || '';
+        res.status(409).json({
+          error: `Erreur d'unicité : ${detailMsg.includes('piece_comptable') ? 'le numéro de pièce comptable est déjà utilisé' : 'une valeur unique est en doublon'} dans la base de données (${detailMsg || 'conflit d’unicité SQL'}).`,
+        });
+        return;
+      }
+      res.status(500).json({ error: `Erreur lors de la modification de l’opération : ${error.message || 'erreur base de données'}` });
       return;
     }
 
-    const [enrichedOperation] = await attachPiecesComptables(adminClient, [data]);
+    await writeAuditLog(adminClient, {
+      userId: authenticatedUser?.id,
+      userEmail: authenticatedUser?.email,
+      userRole: authenticatedUser?.role,
+      action: 'UPDATE_OPERATION',
+      entityId: targetId,
+      details: { champs_modifies: Object.keys(updateData) },
+    });
+
+    const enrichedOperation = formatPersistedPieceComptable(data);
 
     res.json({
       success: true,
-      operation: enrichedOperation || data,
-      transaction: enrichedOperation || data,
+      operation: enrichedOperation,
+      transaction: enrichedOperation,
       message: 'Opération modifiée avec succès',
     });
   } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : 'Erreur interne lors de la modification';
-    res.status(500).json({ error: message });
+    console.error('Erreur updateOperationHandler:', err);
+    res.status(500).json({ error: 'Erreur interne lors de la modification de l’opération.' });
   }
 };
 
@@ -1113,27 +766,26 @@ const deleteOperationsHandler = async (req: express.Request, res: express.Respon
         return;
       }
 
-      // Pour tout utilisateur non-admin (caissières, managers, trésoriers, employés) :
-      // ne bloquer que si la ligne a un created_by ou employee_id défini et différent de l'utilisateur courant (par id ou email)
+      // Pour tout utilisateur non-admin (ex: caissière) :
+      // Vérification stricte de propriété : l'utilisateur ne peut supprimer QUE ses propres opérations.
+      // Règle de parité stricte avec la policy RLS : une ligne sans créateur explicite (created_by ou employee_id vide) ne peut être supprimée que par un admin
       const userEmail = (authenticatedUser?.email || '').toLowerCase().trim();
       const unauthorizedRows = rowsToCheck.filter((r) => {
         const creator = String(r.created_by || r.employee_id || '').trim();
-        // Si aucun créateur n'était renseigné sur la ligne historique, autoriser la suppression
-        if (!creator) return false;
-        const matchesId = callerId && creator === callerId;
-        const matchesEmail = userEmail && creator.toLowerCase() === userEmail;
+        // Si aucun créateur n'est défini en base, interdire la suppression à tout non-administrateur
+        if (!creator) return true;
+        const matchesId = Boolean(callerId && creator === callerId);
+        const matchesEmail = Boolean(userEmail && creator.toLowerCase() === userEmail);
         return !matchesId && !matchesEmail;
       });
 
       if (unauthorizedRows.length > 0) {
         res.status(403).json({
-          error: 'Action refusée : vous ne pouvez modifier que les opérations que vous avez vous-même enregistrées.',
+          error: 'Action refusée : vous ne pouvez supprimer que les opérations que vous avez vous-même enregistrées.',
         });
         return;
       }
     }
-
-    console.warn(`[AUDIT CASHIER] Suppression de ${targetIds.length} opération(s) [${targetIds.join(', ')}] initiée par [${authenticatedUser?.email || authenticatedUser?.id || 'inconnu'}] (rôle: ${userRole || 'non-défini'})`);
 
     const { error, count } = await adminClient
       .from('cashier_transactions')
@@ -1142,9 +794,18 @@ const deleteOperationsHandler = async (req: express.Request, res: express.Respon
 
     if (error) {
       console.error('Erreur SQL lors de la suppression d’opérations:', error.message);
-      res.status(500).json({ error: error.message });
+      res.status(500).json({ error: 'Erreur lors de la suppression des opérations de caisse.' });
       return;
     }
+
+    await writeAuditLog(adminClient, {
+      userId: authenticatedUser?.id,
+      userEmail: authenticatedUser?.email,
+      userRole: userRole,
+      action: 'DELETE_OPERATION',
+      entityId: targetIds.join(','),
+      details: { nombre_supprime: count ?? targetIds.length, ids: targetIds },
+    });
 
     // Nettoyage éventuel des pièces justificatives associées dans storage ou liens
     res.json({
@@ -1153,8 +814,8 @@ const deleteOperationsHandler = async (req: express.Request, res: express.Respon
       message: `${targetIds.length} opération(s) supprimée(s) avec succès`,
     });
   } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : 'Erreur interne lors de la suppression';
-    res.status(500).json({ error: message });
+    console.error('Erreur deleteOperationsHandler:', err);
+    res.status(500).json({ error: 'Erreur interne lors de la suppression des opérations.' });
   }
 };
 
@@ -1210,23 +871,29 @@ const duplicateOperationsHandler = async (req: express.Request, res: express.Res
     }
 
     const todayIso = new Date().toISOString();
-    const rowsToInsert = originalRows.map((orig) => ({
-      libelle: orig.libelle ? `${orig.libelle} (Copie)` : 'Copie opération',
-      service: orig.service,
-      type_description: orig.type_description,
-      category: orig.category,
-      status: 'draft',
-      no_dossier: orig.no_dossier,
-      dossier_id: orig.dossier_id,
-      first_name: orig.first_name,
-      partenaire: orig.partenaire,
-      employee: orig.employee,
-      employee_id: callerId,
-      created_by: callerId,
-      quantity: orig.quantity,
-      montant: orig.montant,
-      date: todayIso,
-    }));
+    const rowsToInsert = await Promise.all(
+      originalRows.map(async (orig) => {
+        // `piece_comptable: null` -> assigné atomiquement par le déclencheur DB pour chaque ligne.
+        return {
+          piece_comptable: null,
+          libelle: orig.libelle ? `${orig.libelle} (Copie)` : 'Copie opération',
+          service: orig.service,
+          type_description: orig.type_description,
+          category: orig.category,
+          status: 'draft',
+          no_dossier: orig.no_dossier,
+          dossier_id: orig.dossier_id,
+          first_name: orig.first_name,
+          partenaire: orig.partenaire,
+          employee: orig.employee,
+          employee_id: callerId,
+          created_by: callerId,
+          quantity: orig.quantity,
+          montant: orig.montant,
+          date: todayIso,
+        };
+      })
+    );
 
     const { data: insertedRows, error: insertErr } = await adminClient
       .from('cashier_transactions')
@@ -1235,19 +902,19 @@ const duplicateOperationsHandler = async (req: express.Request, res: express.Res
 
     if (insertErr) {
       console.error('Erreur SQL lors de la duplication:', insertErr.message);
-      res.status(500).json({ error: insertErr.message });
+      res.status(500).json({ error: 'Erreur lors de la duplication des opérations de caisse.' });
       return;
     }
 
-    const enriched = await attachPiecesComptables(adminClient, insertedRows || []);
+    const enriched = (insertedRows || []).map((r) => formatPersistedPieceComptable(r));
     res.json({
       success: true,
       count: insertedRows?.length || 0,
       data: enriched,
     });
   } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : 'Erreur interne lors de la duplication';
-    res.status(500).json({ error: message });
+    console.error('Erreur duplicateOperationsHandler:', err);
+    res.status(500).json({ error: 'Erreur interne lors de la duplication des opérations.' });
   }
 };
 
@@ -1313,47 +980,57 @@ const updateOperationsStatusHandler = async (req: express.Request, res: express.
 
     if (updateErr) {
       console.error('Erreur SQL mise à jour statut:', updateErr.message);
-      res.status(500).json({ error: updateErr.message });
+      res.status(500).json({ error: 'Erreur lors de la mise à jour du statut des opérations.' });
       return;
     }
 
-    const enriched = await attachPiecesComptables(adminClient, updatedRows || []);
+    const enriched = (updatedRows || []).map((r) => formatPersistedPieceComptable(r));
     res.json({
       success: true,
       count: updatedRows?.length || 0,
       data: enriched,
     });
   } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : 'Erreur interne modification de statut';
-    res.status(500).json({ error: message });
+    console.error('Erreur updateOperationsStatusHandler:', err);
+    res.status(500).json({ error: 'Erreur interne lors de la modification de statut des opérations.' });
   }
 };
 
-// Déclaration des routes de caisse sécurisées par RBAC strict
-app.get('/api/cahier/operations', requireAuth, getOperationsHandler);
-app.get('/api/cashier/transactions', requireAuth, getOperationsHandler);
-app.get('/api/system/operations', requireAuth, getOperationsHandler);
+// Déclaration des routes de caisse sécurisées par RBAC strict (lecture réservée aux rôles financiers et encadrement)
+const cashierReadRoles: UserRole[] = ['admin', 'manager', 'caissiere', 'comptable', 'tresorier'];
+const cashierWriteRoles: UserRole[] = ['admin', 'caissiere', 'manager', 'comptable'];
+const cashierDeleteRoles: UserRole[] = ['admin', 'caissiere'];
+const cashierOperationAliases = ['/api/cahier/operations', '/api/cashier/transactions'];
+
+cashierOperationAliases.forEach((path) => {
+  app.get(path, requireAuth, requireRole(cashierReadRoles), getOperationsHandler);
+});
 
 // Actions en masse (Duplication & Changement de statut)
-app.post('/api/cahier/operations/duplicate', requireAuth, requireRole(['admin', 'caissiere', 'manager', 'comptable']), duplicateOperationsHandler);
-app.post('/api/cashier/transactions/duplicate', requireAuth, requireRole(['admin', 'caissiere', 'manager', 'comptable']), duplicateOperationsHandler);
-app.patch('/api/cahier/operations/status', requireAuth, requireRole(['admin', 'caissiere', 'manager', 'comptable']), updateOperationsStatusHandler);
-app.patch('/api/cashier/transactions/status', requireAuth, requireRole(['admin', 'caissiere', 'manager', 'comptable']), updateOperationsStatusHandler);
+cashierOperationAliases.forEach((path) => {
+  app.post(`${path}/duplicate`, requireAuth, requireRole(cashierWriteRoles), duplicateOperationsHandler);
+  app.patch(`${path}/status`, requireAuth, requireRole(cashierWriteRoles), updateOperationsStatusHandler);
+});
 
 // Écriture : réservée aux Administrateurs, Caissières, Managers et Comptables
-app.post('/api/cahier/operations', requireAuth, requireRole(['admin', 'caissiere', 'manager', 'comptable']), saveOperationHandler);
-app.post('/api/cashier/transactions', requireAuth, requireRole(['admin', 'caissiere', 'manager', 'comptable']), saveOperationHandler);
+cashierOperationAliases.forEach((path) => {
+  app.post(path, requireAuth, requireRole(cashierWriteRoles), saveOperationHandler);
+});
 
-app.put('/api/cahier/operations/:id', requireAuth, requireRole(['admin', 'caissiere', 'manager', 'comptable']), updateOperationHandler);
-app.put('/api/cashier/transactions/:id', requireAuth, requireRole(['admin', 'caissiere', 'manager', 'comptable']), updateOperationHandler);
-app.patch('/api/cahier/operations/:id', requireAuth, requireRole(['admin', 'caissiere', 'manager', 'comptable']), updateOperationHandler);
-app.patch('/api/cashier/transactions/:id', requireAuth, requireRole(['admin', 'caissiere', 'manager', 'comptable']), updateOperationHandler);
+cashierOperationAliases.forEach((path) => {
+  app.put(`${path}/:id`, requireAuth, requireRole(cashierWriteRoles), updateOperationHandler);
+  app.patch(`${path}/:id`, requireAuth, requireRole(cashierWriteRoles), updateOperationHandler);
+});
 
-// Suppression : autorisée pour tout utilisateur authentifié (vérification stricte de propriété dans deleteOperationsHandler)
-app.delete('/api/cahier/operations/:id', requireAuth, deleteOperationsHandler);
-app.delete('/api/cashier/transactions/:id', requireAuth, deleteOperationsHandler);
-app.delete('/api/cahier/operations', requireAuth, deleteOperationsHandler);
-app.delete('/api/cashier/transactions', requireAuth, deleteOperationsHandler);
+// Audit de conformité et intégrité de la séquence des pièces comptables
+app.get('/api/cashier/audit-pieces', requireAuth, requireRole(cashierReadRoles), auditPiecesComptablesHandler);
+app.get('/api/cahier/audit-pieces', requireAuth, requireRole(cashierReadRoles), auditPiecesComptablesHandler);
+
+// Suppression : autorisée pour les Administrateurs et Caissières (vérification stricte de propriété dans deleteOperationsHandler)
+cashierOperationAliases.forEach((path) => {
+  app.delete(`${path}/:id`, requireAuth, requireRole(cashierDeleteRoles), deleteOperationsHandler);
+  app.delete(path, requireAuth, requireRole(cashierDeleteRoles), deleteOperationsHandler);
+});
 
 /**
  * Example Express Rest API endpoints can be defined here.

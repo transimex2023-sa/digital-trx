@@ -4,8 +4,19 @@ import {
   CashierFilterState,
   CashierTransaction,
 } from '../models/cashier-transaction.model';
+import {
+  findDuplicatePieceComptable,
+  findDuplicateTransaction,
+  formatIsoToDisplayDate,
+  generateTransactionFingerprint,
+  normalizePieceComptable,
+  toStandardIsoDateString,
+} from '../utils/cashier-duplicate.util';
 import { SupabaseService } from './supabase.service';
 import { AuthService } from './auth.service';
+import { ExportService } from './export.service';
+import { NotificationService } from './notification.service';
+import { ParsedImportRow } from './import.service';
 
 export interface CashierDbRow {
   id: string;
@@ -26,13 +37,11 @@ export interface CashierDbRow {
   montant: number;
   solde_apres?: number | null;
   selected?: boolean;
+  created_by?: string | null;
+  employee_id?: string | null;
   created_at?: string;
   updated_at?: string;
 }
-
-// Colonnes sélectionnées selon le principe du moindre privilège alignées sur le schéma Supabase
-const CASHIER_SELECTED_COLUMNS =
-  'id, date, libelle, service, type_description, category, status, no_dossier, first_name, partenaire, employee, quantity, montant, solde_apres, selected, created_at, updated_at';
 
 @Injectable({
   providedIn: 'root',
@@ -40,6 +49,8 @@ const CASHIER_SELECTED_COLUMNS =
 export class CashierService implements OnDestroy {
   private readonly supabaseService = inject(SupabaseService);
   private readonly authService = inject(AuthService);
+  private readonly exportService = inject(ExportService);
+  private readonly notificationService = inject(NotificationService);
   private readonly platformId = inject(PLATFORM_ID);
   private readonly isBrowser = isPlatformBrowser(this.platformId);
 
@@ -50,17 +61,20 @@ export class CashierService implements OnDestroy {
   private errorTimeout: ReturnType<typeof setTimeout> | null = null;
   private realtimeChannel: ReturnType<NonNullable<SupabaseService['supabase']>['channel']> | null = null;
 
-  public setError(message: string | null): void {
+  public setError(message: string | null, notify = true): void {
     if (this.errorTimeout) {
       clearTimeout(this.errorTimeout);
       this.errorTimeout = null;
     }
     this._error.set(message);
-    if (message) {
-      this.errorTimeout = setTimeout(() => {
-        this._error.set(null);
-        this.errorTimeout = null;
-      }, 5000);
+
+    if (message && notify) {
+      const lower = message.toLowerCase();
+      if (lower.includes('doublon') || lower.includes('pièce comptable') || lower.includes('identique') || lower.includes('déjà attribué') || lower.includes('déjà enregistré')) {
+        this.notificationService.warning(message, 'Doublon détecté');
+      } else {
+        this.notificationService.error(message, 'Erreur');
+      }
     }
   }
 
@@ -98,29 +112,48 @@ export class CashierService implements OnDestroy {
     this.cleanupRealtimeSubscription();
   }
 
-  // Filtres et pagination
+  // Filtres et pagination (plancher de 80 lignes minimum par page)
   private readonly _filterState = signal<CashierFilterState>({
     searchQuery: '',
     categoryFilter: 'all',
     pageIndex: 0,
-    pageSize: 10,
+    pageSize: 80,
   });
 
   // Signal pour piloter l'ouverture de la ligne d'ajout inline depuis le Layout
   public readonly isAddingRow = signal<boolean>(false);
 
+  // Signal pour piloter l'ouverture de la boîte modale d'importation Excel / CSV
+  public readonly isImportModalOpen = signal<boolean>(false);
+
+  public openImportModal(): void {
+    this.isImportModalOpen.set(true);
+  }
+
+  public closeImportModal(): void {
+    this.isImportModalOpen.set(false);
+  }
+
   // Signal calculé pour la prochaine référence de pièce comptable prévisionnelle (ex: CSH1/2026/00004)
   public readonly nextPieceComptable = computed<string>(() => {
     const list = this._transactions();
     const currentYear = new Date().getFullYear() || 2026;
-    const yearTxCount = list.filter((t) => {
-      const yrMatch = t.date?.includes('/')
-        ? Number(t.date.split('/')[2])
-        : (t.date?.includes('-') ? Number(t.date.split('-')[0]) : currentYear);
-      return (isNaN(yrMatch) ? currentYear : yrMatch) === currentYear;
-    }).length;
+    const prefix = `CSH1/${currentYear}/`;
+    let maxSeq = 0;
 
-    return `CSH1/${currentYear}/${String(yearTxCount + 1).padStart(5, '0')}`;
+    for (const t of list) {
+      const piece = normalizePieceComptable(t.pieceComptable);
+      if (piece && piece.startsWith(prefix)) {
+        const seqStr = piece.substring(prefix.length);
+        const seqNum = parseInt(seqStr, 10);
+        if (!isNaN(seqNum) && seqNum > maxSeq) {
+          maxSeq = seqNum;
+        }
+      }
+    }
+
+    const nextNum = maxSeq > 0 ? maxSeq + 1 : list.length + 1;
+    return `${prefix}${String(nextNum).padStart(5, '0')}`;
   });
 
   // États exposés en lecture seule
@@ -189,17 +222,21 @@ export class CashierService implements OnDestroy {
     return currentList.length > 0 && currentList.every((tx) => !!tx.selected);
   });
 
+  public static readonly DEFAULT_OPERATIONS_LIMIT = 1000;
+
   private activeLoadPromise: Promise<void> | null = null;
 
   /**
    * ───────────────────────────────────────────────────────────────────────────
-   * 1. LECTURE HAUTE DISPONIBILITÉ : DOUBLE CANAL (API EXPRESS + REPLI DIRECT SUPABASE)
+  * 1. LECTURE CENTRALISÉE VIA L'API EXPRESS
    * ───────────────────────────────────────────────────────────────────────────
    * Tente d'abord de récupérer les opérations via l'API Express rapide (/api/cahier/operations).
-   * En cas d'indisponibilité ou d'erreur réseau, bascule immédiatement sur le SDK client Supabase.
+  * En cas d'indisponibilité ou d'erreur réseau, l'opération échoue sans contourner les contrôles serveur.
    * Gère la déduplication des appels concurrents via une Promesse unique partagée.
+   * Borne systématiquement le volume à `limit` (1000 par défaut) sur les deux canaux
+   * afin de protéger l'onglet contre toute surcharge mémoire en situation dégradée.
    */
-  public async loadTransactions(): Promise<void> {
+  public async loadTransactions(limit: number = CashierService.DEFAULT_OPERATIONS_LIMIT): Promise<void> {
     if (this.activeLoadPromise) {
       return this.activeLoadPromise;
     }
@@ -232,7 +269,7 @@ export class CashierService implements OnDestroy {
               Authorization: `Bearer ${token}`,
             };
 
-            const response = await fetch('/api/cahier/operations', {
+            const response = await fetch(`/api/cahier/operations?limit=${limit}`, {
               method: 'GET',
               headers,
             });
@@ -243,35 +280,16 @@ export class CashierService implements OnDestroy {
               if (Array.isArray(ops)) {
                 rawRows = ops as CashierDbRow[];
               }
+            } else {
+              console.warn(`API Express /api/cahier/operations a répondu HTTP ${response.status} pendant le chargement.`);
             }
           } catch (apiErr) {
-            console.warn('API Express /api/cahier/operations indisponible, bascule sur Supabase direct:', apiErr);
+            console.warn('API Express /api/cahier/operations indisponible pendant le chargement:', apiErr);
           }
         }
 
-        // Canal 2 (REPLI DIRECT SUPABASE CLIENT) : Interrogation directe de Supabase
-        if (!rawRows) {
-          try {
-            await this.supabaseService.ensureInitialized();
-            const client = this.supabaseService.supabase;
-
-            if (client) {
-              const { data, error } = await client
-                .from('cashier_transactions')
-                .select(CASHIER_SELECTED_COLUMNS)
-                .order('date', { ascending: false })
-                .order('created_at', { ascending: false });
-
-              if (!error && data && Array.isArray(data)) {
-                rawRows = data as CashierDbRow[];
-              } else if (error) {
-                console.warn('Requête Supabase direct cashier_transactions:', error.message);
-              }
-            }
-          } catch (supabaseErr) {
-            console.warn('Échec de la récupération Supabase direct:', supabaseErr);
-          }
-        }
+        // Aucun repli direct Supabase et aucune alerte utilisateur pendant un
+        // chargement automatique : les erreurs seront visibles lors d'une action.
 
         // Traitement et injection dans le Signal Angular 19
         if (rawRows && Array.isArray(rawRows)) {
@@ -290,17 +308,7 @@ export class CashierService implements OnDestroy {
   }
 
   private toIsoDateString(dStr?: string): string {
-    if (!dStr) return new Date().toISOString();
-    if (dStr.includes('/')) {
-      const parts = dStr.split('/');
-      if (parts.length === 3) {
-        const parsed = new Date(`${parts[2]}-${parts[1].padStart(2, '0')}-${parts[0].padStart(2, '0')}`);
-        if (!isNaN(parsed.getTime())) return parsed.toISOString();
-      }
-    }
-    const parsed = new Date(dStr);
-    if (!isNaN(parsed.getTime())) return parsed.toISOString();
-    return new Date().toISOString();
+    return toStandardIsoDateString(dStr);
   }
 
   /**
@@ -314,6 +322,39 @@ export class CashierService implements OnDestroy {
     op: Partial<CashierTransaction> | Omit<CashierTransaction, 'id' | 'soldeApres' | 'selected'>
   ): Promise<{ success: boolean; operation?: CashierTransaction; error?: string }> {
     this._error.set(null);
+
+    // Si une pièce comptable est explicitement fournie par l'appelant (ex: import ou rattachement manuel), on la normalise
+    const explicitPiece = op.pieceComptable ? normalizePieceComptable(op.pieceComptable) : undefined;
+    if (explicitPiece) {
+      const pieceDuplicate = findDuplicatePieceComptable({ pieceComptable: explicitPiece }, this._transactions());
+      if (pieceDuplicate) {
+        const errorMsg = `Le numéro de pièce comptable "${explicitPiece}" est déjà attribué à une autre opération (ID: ${pieceDuplicate.id}, Date: ${pieceDuplicate.date}, Libellé: "${pieceDuplicate.libelle}"). Les numéros de pièces comptables doivent être strictement uniques.`;
+        this.setError(errorMsg);
+        return { success: false, error: errorMsg };
+      }
+    }
+
+    // Contrôle d'unicité par empreinte métier : Date + Montant + Libellé + N° de dossier/matricule + Service
+    const existingDuplicate = findDuplicateTransaction(
+      {
+        date: op.date,
+        montant: op.montant,
+        category: op.category,
+        libelle: op.libelle,
+        noDossier: op.noDossier,
+        service: op.service,
+        pieceComptable: explicitPiece,
+      },
+      this._transactions()
+    );
+
+    if (existingDuplicate) {
+      const montantFmt = Math.abs(Number(existingDuplicate.montant)).toLocaleString('fr-FR');
+      const errorMsg = `Opération déjà enregistrée : une opération identique existe déjà en caisse (Date: ${existingDuplicate.date}, Montant: ${montantFmt} FCFA, Service: ${existingDuplicate.service || 'N/A'}, Libellé: "${existingDuplicate.libelle}"). La double saisie est interdite.`;
+      this.setError(errorMsg);
+      return { success: false, error: errorMsg };
+    }
+
     const token = this.authService.token();
     const currentSolde = this.currentBalance();
     const montant = Number(op.montant) || 0;
@@ -322,6 +363,7 @@ export class CashierService implements OnDestroy {
     let savedRow: CashierDbRow | null = null;
 
     // Étape 1 : Appel de l'API Serveur-Relais sécurisée
+    // Comme sur Odoo, si explicitPiece est vide (création standard), on envoie null/undefined pour que le trigger assigne la séquence
     try {
       const headers: Record<string, string> = {
         'Content-Type': 'application/json',
@@ -334,6 +376,7 @@ export class CashierService implements OnDestroy {
         method: 'POST',
         headers,
         body: JSON.stringify({
+          pieceComptable: explicitPiece || null,
           libelle: op.libelle,
           service: op.service,
           typeDescription: op.typeDescription || null,
@@ -354,87 +397,60 @@ export class CashierService implements OnDestroy {
         savedRow = (resJson.operation || resJson.transaction) as CashierDbRow;
       } else {
         const errJson = await response.json().catch(() => ({}));
-        throw new Error(errJson.error || `Erreur serveur ${response.status}`);
+        const serverError = errJson.error || `Erreur serveur ${response.status}`;
+
+        // RÈGLE D'OR : Si le serveur signale un doublon (409 Conflict) ou un refus explicite,
+        // stoppe immédiatement : aucun repli pirate n'est toléré.
+        if (response.status === 409 || response.status === 400 || response.status === 403) {
+          this.setError(serverError);
+          return { success: false, error: serverError };
+        }
+
+        throw new Error(serverError);
       }
     } catch (apiErr: unknown) {
-      console.warn('Appel API /api/cahier/operations échoué, tentative via client Supabase direct:', apiErr);
-
-      // Étape 2 (REPLI) : Sauvegarde directe via client Supabase si API injoignable
-      try {
-        await this.supabaseService.ensureInitialized();
-        const client = this.supabaseService.supabase;
-        if (client) {
-          const { data, error } = await client
-            .from('cashier_transactions')
-            .insert([
-              {
-                libelle: op.libelle,
-                service: op.service || null,
-                type_description: op.typeDescription || null,
-                category: op.category,
-                status: op.status || 'draft',
-                no_dossier: op.noDossier || null,
-                first_name: op.firstName || null,
-                partenaire: op.partenaire || op.employee || null,
-                employee: op.employee || op.partenaire || null,
-                quantity: op.quantity || 1,
-                montant: op.montant,
-                date: op.date || new Date().toISOString(),
-              },
-            ])
-            .select()
-            .single();
-
-          if (!error && data) {
-            savedRow = data as CashierDbRow;
-          }
-        }
-      } catch (directErr) {
-        console.warn('Échec du repli direct Supabase insert:', directErr);
+      const errMsg = apiErr instanceof Error ? apiErr.message : String(apiErr);
+      if (errMsg.includes('doublon') || errMsg.includes('409') || errMsg.includes('interdite') || errMsg.includes('pièce')) {
+        this.setError(errMsg);
+        return { success: false, error: errMsg };
       }
+
+      console.warn('Appel API /api/cahier/operations échoué, aucune écriture directe Supabase autorisée:', apiErr);
+      this.setError('Le service de caisse est temporairement indisponible. Veuillez réessayer.');
+      return { success: false, error: this._error()! };
     }
 
-    // Étape 3 : Création de l'objet transaction unifié
-    const operationToStore: CashierTransaction = savedRow
-      ? {
-          id: savedRow.id,
-          pieceComptable: savedRow.piece_comptable || this.nextPieceComptable(),
-          date: this.formatDate(savedRow.date || new Date().toISOString()),
-          libelle: savedRow.libelle,
-          service: savedRow.service || savedRow.type_transaction || '',
-          typeDescription: savedRow.type_description || '',
-          category: savedRow.category as 'entree' | 'sortie',
-          status: (savedRow.status as 'draft' | 'posted' | 'cancelled') || op.status || 'draft',
-          noDossier: savedRow.no_dossier || savedRow.matricule_vehicule || '',
-          firstName: savedRow.first_name || '',
-          employee: savedRow.employee || '',
-          partenaire: savedRow.partenaire || savedRow.employee || '',
-          quantity: savedRow.quantity ? Number(savedRow.quantity) : undefined,
-          montant: Number(savedRow.montant),
-          soldeApres: savedRow.solde_apres !== undefined && savedRow.solde_apres !== null ? Number(savedRow.solde_apres) : estimatedNewSolde,
-          selected: false,
-          createdAt: savedRow.created_at || new Date().toISOString(),
-          updatedAt: savedRow.updated_at,
-        }
-      : {
-          id: `tx-${Date.now()}`,
-          pieceComptable: this.nextPieceComptable(),
-          date: this.formatDate(op.date || new Date().toISOString()),
-          libelle: op.libelle || 'Opération',
-          service: op.service || '',
-          typeDescription: op.typeDescription || '',
-          category: (op.category || (montant >= 0 ? 'entree' : 'sortie')) as 'entree' | 'sortie',
-          status: op.status || 'draft',
-          noDossier: op.noDossier || '',
-          firstName: op.firstName || '',
-          employee: op.employee || op.partenaire || '',
-          partenaire: op.partenaire || op.employee || '',
-          quantity: op.quantity,
-          montant,
-          soldeApres: estimatedNewSolde,
-          selected: false,
-          createdAt: new Date().toISOString(),
-        };
+    // Si aucune sauvegarde réelle n'a pu être actée, NE JAMAIS injecter de ligne factice locale
+    if (!savedRow) {
+      const failureMsg = this._error() || 'Impossible d’enregistrer l’opération : échec de validation du serveur.';
+      this.setError(failureMsg);
+      return { success: false, error: failureMsg };
+    }
+
+    // Étape 3 : Création de l'objet transaction unifié (comme sur Odoo : la pièce officielle retournée par la base)
+    const currentUserId = this.authService.currentUser()?.id;
+    const operationToStore: CashierTransaction = {
+      id: savedRow.id,
+      pieceComptable: savedRow.piece_comptable || explicitPiece || this.nextPieceComptable(),
+      date: this.formatDate(savedRow.date || new Date().toISOString()),
+      libelle: savedRow.libelle,
+      service: savedRow.service || savedRow.type_transaction || '',
+      typeDescription: savedRow.type_description || '',
+      category: savedRow.category as 'entree' | 'sortie',
+      status: (savedRow.status as 'draft' | 'posted' | 'cancelled') || op.status || 'draft',
+      noDossier: savedRow.no_dossier || savedRow.matricule_vehicule || '',
+      firstName: savedRow.first_name || '',
+      employee: savedRow.employee || '',
+      partenaire: savedRow.partenaire || savedRow.employee || '',
+      quantity: savedRow.quantity ? Number(savedRow.quantity) : undefined,
+      montant: Number(savedRow.montant),
+      soldeApres: savedRow.solde_apres !== undefined && savedRow.solde_apres !== null ? Number(savedRow.solde_apres) : estimatedNewSolde,
+      selected: false,
+      createdBy: savedRow.created_by || currentUserId || undefined,
+      employeeId: savedRow.employee_id || currentUserId || undefined,
+      createdAt: savedRow.created_at || new Date().toISOString(),
+      updatedAt: savedRow.updated_at,
+    };
 
     // Étape 4 (RÉACTIVITÉ INSTANTANÉE) : Mise à jour immédiate du Signal Angular 19
     this._transactions.update((currentOps) => [operationToStore, ...currentOps]);
@@ -448,8 +464,100 @@ export class CashierService implements OnDestroy {
    */
   public async addTransaction(
     newTx: Omit<CashierTransaction, 'id' | 'soldeApres' | 'selected'>
-  ): Promise<{ success: boolean; operation?: CashierTransaction }> {
+  ): Promise<{ success: boolean; operation?: CashierTransaction; error?: string }> {
     return this.saveOperationViaApi(newTx);
+  }
+
+  /**
+   * Importation par lot d'écritures de caisse (issues d'Excel ou CSV)
+   */
+  public async importTransactions(
+    rows: ParsedImportRow[]
+  ): Promise<{ success: boolean; insertedCount: number; duplicateCount: number; errors: string[] }> {
+    if (!rows || rows.length === 0) {
+      return { success: true, insertedCount: 0, duplicateCount: 0, errors: [] };
+    }
+
+    let insertedCount = 0;
+    let duplicateCount = 0;
+    const errors: string[] = [];
+    const seenFingerprintsInBatch = new Set<string>();
+    const seenPiecesInBatch = new Set<string>();
+
+    for (const row of rows) {
+      const candidatePiece = normalizePieceComptable(row.pieceComptable);
+      if (candidatePiece) {
+        const isPieceInBatch = seenPiecesInBatch.has(candidatePiece);
+        const dbPieceDup = findDuplicatePieceComptable({ pieceComptable: candidatePiece }, this._transactions());
+        if (isPieceInBatch || dbPieceDup) {
+          duplicateCount++;
+          const origin = dbPieceDup ? 'déjà existant en caisse' : 'en double dans le fichier importé';
+          errors.push(`Doublon de pièce comptable bloqué : "${candidatePiece}" (${row.libelle}) - ${origin}.`);
+          continue;
+        }
+        seenPiecesInBatch.add(candidatePiece);
+      }
+
+      const candidate = {
+        date: row.date,
+        montant: row.montant,
+        libelle: row.libelle,
+        noDossier: row.noDossier,
+        service: row.service,
+        pieceComptable: candidatePiece,
+      };
+
+      const fingerprint = generateTransactionFingerprint(candidate);
+      const isDuplicateInBatch = seenFingerprintsInBatch.has(fingerprint);
+      const isDuplicateInDb = !!findDuplicateTransaction(candidate, this._transactions());
+
+      if (isDuplicateInBatch || isDuplicateInDb) {
+        duplicateCount++;
+        const origin = isDuplicateInDb ? 'déjà enregistrée en caisse' : 'en double dans le fichier';
+        errors.push(`Doublon détecté et bloqué : "${row.libelle}" (${row.date}, ${row.montant} FCFA, ${row.service || 'Sans service'}) - ${origin}.`);
+        continue;
+      }
+
+      seenFingerprintsInBatch.add(fingerprint);
+
+      try {
+        const res = await this.addTransaction({
+          pieceComptable: candidatePiece || undefined,
+          date: row.date,
+          libelle: row.libelle,
+          service: row.service,
+          category: row.category,
+          status: row.status || 'draft',
+          noDossier: row.noDossier,
+          partenaire: row.partenaire || row.employee,
+          employee: row.employee || row.partenaire,
+          quantity: row.quantity,
+          montant: row.montant,
+        });
+
+        if (res.success) {
+          insertedCount++;
+        } else {
+          errors.push(`Écriture "${row.libelle}" : ${res.error || 'échec de sauvegarde.'}`);
+        }
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : 'Erreur inconnue';
+        errors.push(`Écriture "${row.libelle}" : ${msg}`);
+      }
+    }
+
+    // Après l'insertion du lot, forcer le rechargement depuis le serveur pour synchroniser
+    // l'état local avec les pièces officielles et soldes recalculés en base de données.
+    if (insertedCount > 0) {
+      await this.loadTransactions();
+    }
+
+    return {
+      success: insertedCount > 0 || duplicateCount > 0,
+      insertedCount,
+      duplicateCount,
+      errors,
+    };
   }
 
   /**
@@ -469,18 +577,45 @@ export class CashierService implements OnDestroy {
     updatedFields: Partial<Omit<CashierTransaction, 'id' | 'soldeApres' | 'selected'>>
   ): Promise<{ success: boolean; message?: string }> {
     this._error.set(null);
-    const token = this.authService.token();
 
-    // 1. Convertir la date affichée (ex: "05/09/2026") en ISO si besoin
-    let isoDate: string | undefined;
-    if (updatedFields.date) {
-      const parts = updatedFields.date.split('/');
-      if (parts.length === 3) {
-        isoDate = new Date(`${parts[2]}-${parts[1]}-${parts[0]}`).toISOString();
-      } else {
-        isoDate = new Date(updatedFields.date).toISOString();
+    // Contrôle d'unicité strict lors de la modification
+    const currentTx = this._transactions().find((t) => t.id === id);
+    if (currentTx) {
+      const targetPiece = normalizePieceComptable(
+        updatedFields.pieceComptable !== undefined ? updatedFields.pieceComptable : currentTx.pieceComptable
+      );
+
+      if (targetPiece) {
+        const pieceDuplicate = findDuplicatePieceComptable({ id, pieceComptable: targetPiece }, this._transactions());
+        if (pieceDuplicate) {
+          const errorMsg = `Modification refusée : le numéro de pièce comptable "${targetPiece}" est déjà attribué à une autre opération (ID: ${pieceDuplicate.id}, Date: ${pieceDuplicate.date}, Libellé: "${pieceDuplicate.libelle}"). Un numéro de pièce doit être strictement unique.`;
+          this.setError(errorMsg);
+          return { success: false, message: errorMsg };
+        }
+      }
+
+      const candidate = {
+        id,
+        date: updatedFields.date !== undefined ? updatedFields.date : currentTx.date,
+        montant: updatedFields.montant !== undefined ? updatedFields.montant : currentTx.montant,
+        category: updatedFields.category !== undefined ? updatedFields.category : currentTx.category,
+        libelle: updatedFields.libelle !== undefined ? updatedFields.libelle : currentTx.libelle,
+        noDossier: updatedFields.noDossier !== undefined ? updatedFields.noDossier : currentTx.noDossier,
+        service: updatedFields.service !== undefined ? updatedFields.service : currentTx.service,
+        pieceComptable: targetPiece,
+      };
+      const duplicate = findDuplicateTransaction(candidate, this._transactions());
+      if (duplicate) {
+        const errorMsg = `Modification refusée : une opération identique existe déjà en caisse (Date: ${duplicate.date}, Montant: ${duplicate.montant} FCFA, Service: ${duplicate.service || 'N/A'}, Libellé: "${duplicate.libelle}").`;
+        this.setError(errorMsg);
+        return { success: false, message: errorMsg };
       }
     }
+
+    const token = this.authService.token();
+
+    // 1. Convertir la date affichée en ISO standard sans décalage de fuseau horaire
+    const isoDate = updatedFields.date ? toStandardIsoDateString(updatedFields.date) : undefined;
 
     // 2. Appel vers l'API serveur-relais
     let updatedViaApi = false;
@@ -525,47 +660,7 @@ export class CashierService implements OnDestroy {
       apiErrorMessage = apiErr instanceof Error ? apiErr.message : 'Erreur réseau';
     }
 
-    // 3. Repli direct Supabase si l'API Express n'a pas répondu (sauf en cas de refus explicite 403)
-    let updatedViaSupabase = false;
-    const isPermissionError = apiErrorMessage.includes('Action refusée') || apiErrorMessage.includes('403');
-    if (!updatedViaApi && !isPermissionError) {
-      try {
-        await this.supabaseService.ensureInitialized();
-        const client = this.supabaseService.supabase;
-        if (client) {
-          const directPayload: Record<string, unknown> = {};
-          if (updatedFields.libelle !== undefined) directPayload['libelle'] = updatedFields.libelle;
-          if (updatedFields.service !== undefined) directPayload['service'] = updatedFields.service;
-          if (updatedFields.typeDescription !== undefined) directPayload['type_description'] = updatedFields.typeDescription || null;
-          if (updatedFields.category !== undefined) directPayload['category'] = updatedFields.category;
-          if (updatedFields.status !== undefined) directPayload['status'] = updatedFields.status;
-          if (updatedFields.noDossier !== undefined) directPayload['no_dossier'] = updatedFields.noDossier || null;
-          if (updatedFields.firstName !== undefined) directPayload['first_name'] = updatedFields.firstName || null;
-          if (updatedFields.partenaire !== undefined) directPayload['partenaire'] = updatedFields.partenaire || null;
-          if (updatedFields.employee !== undefined) directPayload['employee'] = updatedFields.employee || null;
-          if (updatedFields.quantity !== undefined) directPayload['quantity'] = updatedFields.quantity;
-          if (updatedFields.montant !== undefined) directPayload['montant'] = updatedFields.montant;
-          if (updatedFields.pieceComptable !== undefined) directPayload['piece_comptable'] = updatedFields.pieceComptable;
-          if (isoDate) directPayload['date'] = isoDate;
-
-          const { data, error } = await client
-            .from('cashier_transactions')
-            .update(directPayload)
-            .eq('id', id)
-            .select();
-
-          if (!error && data && data.length > 0) {
-            updatedViaSupabase = true;
-          } else if (error) {
-            apiErrorMessage = error.message;
-          }
-        }
-      } catch (directErr) {
-        console.warn('Échec du repli direct Supabase update:', directErr);
-      }
-    }
-
-    if (!updatedViaApi && !updatedViaSupabase) {
+    if (!updatedViaApi) {
       let finalMsg = apiErrorMessage || 'Échec de la sauvegarde en base de données';
       if (
         finalMsg.includes('403') ||
@@ -576,7 +671,7 @@ export class CashierService implements OnDestroy {
       ) {
         finalMsg = 'Action refusée : vous ne pouvez modifier que les opérations que vous avez vous-même enregistrées.';
       }
-      this.setError(finalMsg);
+      this.setError(finalMsg, false);
       return { success: false, message: finalMsg };
     }
 
@@ -687,27 +782,9 @@ export class CashierService implements OnDestroy {
       console.warn('Erreur réseau appel API Express DELETE, tentative repli Supabase:', networkErr);
     }
 
-    // Étape 2 : Repli direct Supabase si l'API Express a rencontré une erreur réseau (sauf en cas de 403)
-    const isDeleteForbidden = failureReason && (failureReason.includes('Action refusée') || failureReason.includes('403'));
-    if (!deletedSuccessfully && !failureReason && !isDeleteForbidden) {
-      try {
-        await this.supabaseService.ensureInitialized();
-        const client = this.supabaseService.supabase;
-        if (client) {
-          const { error } = await client
-            .from('cashier_transactions')
-            .delete()
-            .in('id', targetIds);
-
-          if (error) {
-            failureReason = error.message;
-          } else {
-            deletedSuccessfully = true;
-          }
-        }
-      } catch (err) {
-        failureReason = err instanceof Error ? err.message : 'Échec de la suppression directe';
-      }
+    // Une panne de l'API ne doit jamais déclencher une suppression directe via Supabase.
+    if (!deletedSuccessfully && !failureReason) {
+      failureReason = 'Le service de caisse est temporairement indisponible. Veuillez réessayer.';
     }
 
     // Si la suppression a échoué en base de données, on refuse la suppression dans l'UI et on alerte l'utilisateur
@@ -735,61 +812,16 @@ export class CashierService implements OnDestroy {
 
   /**
    * ───────────────────────────────────────────────────────────────────────────
-   * 4. EXPORT DES OPÉRATIONS DE CAISSE (CSV / EXCEL COMPATIBLE)
+   * 4. EXPORT DES OPÉRATIONS DE CAISSE (DÉLÉGUÉ À EXPORTSERVICE)
    * ───────────────────────────────────────────────────────────────────────────
-   * Exporte soit les lignes sélectionnées, soit l'ensemble des opérations visibles.
+   * Exporte soit les lignes sélectionnées, soit l'ensemble des opérations filtrées visibles.
    */
   public exportTransactions(onlySelected = false): void {
-    const all = this._transactions();
-    const rowsToExport = onlySelected ? all.filter((t) => t.selected) : all;
-    const dataset = rowsToExport.length > 0 ? rowsToExport : all;
+    const allFiltered = this.filteredTransactions();
+    const selectedRows = this._transactions().filter((t) => t.selected);
+    const dataset = onlySelected && selectedRows.length > 0 ? selectedRows : allFiltered;
 
-    if (dataset.length === 0) return;
-
-    // En-têtes CSV
-    const headers = [
-      'Date',
-      'Pièce comptable',
-      'Libellé',
-      'Partenaire / Employé',
-      'N° Dossier',
-      'Service',
-      'Quantité',
-      'Montant (FCFA)',
-      'Solde courant (FCFA)',
-      'Statut',
-    ];
-
-    const csvRows = [headers.join(';')];
-
-    for (const tx of dataset) {
-      const row = [
-        `"${tx.date || ''}"`,
-        `"${tx.pieceComptable || ''}"`,
-        `"${(tx.libelle || '').replace(/"/g, '""')}"`,
-        `"${(tx.employee || tx.partenaire || '').replace(/"/g, '""')}"`,
-        `"${(tx.noDossier || '').replace(/"/g, '""')}"`,
-        `"${(tx.service || '').replace(/"/g, '""')}"`,
-        tx.quantity !== undefined && tx.quantity !== null ? tx.quantity : '',
-        tx.montant,
-        tx.soldeApres !== undefined && tx.soldeApres !== null ? tx.soldeApres : '',
-        tx.status === 'posted' ? 'Comptabilisé' : (tx.status === 'cancelled' ? 'Annulé' : 'Brouillon'),
-      ];
-      csvRows.push(row.join(';'));
-    }
-
-    // Création du Blob avec BOM UTF-8 pour Excel
-    const csvContent = '\uFEFF' + csvRows.join('\r\n');
-    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    const today = new Date().toISOString().slice(0, 10);
-    link.setAttribute('href', url);
-    link.setAttribute('download', `journal_de_caisse_${today}.csv`);
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    URL.revokeObjectURL(url);
+    this.exportService.exportCashierTransactionsCsv(dataset);
   }
 
   /**
@@ -841,58 +873,17 @@ export class CashierService implements OnDestroy {
         this.recalculateRunningBalances();
         this.toggleSelectAll(false);
         return true;
+      } else {
+        const errJson = await response.json().catch(() => ({}));
+        const serverError = errJson.error || `Erreur lors de la duplication (${response.status})`;
+        this.setError(serverError);
+        return false;
       }
-    } catch {
-      // Ignorer et basculer sur fallback direct
+    } catch (netErr) {
+      console.warn('Erreur réseau lors de la duplication API:', netErr);
     }
 
-    // Repli direct Supabase si l'API n'a pas répondu
-    try {
-      await this.supabaseService.ensureInitialized();
-      const client = this.supabaseService.supabase;
-      if (client) {
-        const originalRows = this._transactions().filter((t) => t.selected);
-        const callerId = this.authService.currentUser()?.id || null;
-        const todayIso = new Date().toISOString();
-
-        const rowsToInsert = originalRows.map((orig) => ({
-          libelle: orig.libelle ? `${orig.libelle} (Copie)` : 'Copie opération',
-          service: orig.service,
-          type_description: orig.typeDescription,
-          category: orig.category,
-          status: 'draft',
-          no_dossier: orig.noDossier,
-          partenaire: orig.partenaire,
-          employee: orig.employee,
-          employee_id: callerId,
-          created_by: callerId,
-          quantity: orig.quantity,
-          montant: orig.montant,
-          date: todayIso,
-        }));
-
-        const { data, error } = await client
-          .from('cashier_transactions')
-          .insert(rowsToInsert)
-          .select();
-
-        if (error) {
-          this._error.set(error.message);
-          return false;
-        }
-
-        if (data) {
-          const mapped = (data as CashierDbRow[]).map((r) => this.mapSingleDbRow(r));
-          this._transactions.update((currentList) => [...mapped, ...currentList]);
-          this.recalculateRunningBalances();
-          this.toggleSelectAll(false);
-          return true;
-        }
-      }
-    } catch (err) {
-      console.warn('Erreur lors de la duplication Supabase:', err);
-    }
-
+    this.setError('Le service de caisse est temporairement indisponible. Veuillez réessayer.');
     return false;
   }
 
@@ -940,30 +931,7 @@ export class CashierService implements OnDestroy {
       // Ignorer
     }
 
-    // Repli direct Supabase
-    try {
-      await this.supabaseService.ensureInitialized();
-      const client = this.supabaseService.supabase;
-      if (client) {
-        const { error } = await client
-          .from('cashier_transactions')
-          .update({ status: 'draft' })
-          .in('id', selectedIds);
-
-        if (error) {
-          this._error.set(error.message);
-          return false;
-        }
-
-        this._transactions.update((items) =>
-          items.map((it) => (selectedIds.includes(it.id) ? { ...it, status: 'draft', selected: false } : it))
-        );
-        return true;
-      }
-    } catch (err) {
-      console.warn('Erreur lors du changement de statut Supabase:', err);
-    }
-
+    this.setError('Le service de caisse est temporairement indisponible. Veuillez réessayer.');
     return false;
   }
 
@@ -1136,6 +1104,8 @@ export class CashierService implements OnDestroy {
       montant: numMontant,
       soldeApres: row.solde_apres !== undefined && row.solde_apres !== null ? Number(row.solde_apres) : 0,
       selected: !!row.selected,
+      createdBy: row.created_by || undefined,
+      employeeId: row.employee_id || undefined,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
     };
@@ -1166,11 +1136,11 @@ export class CashierService implements OnDestroy {
         : (row.date?.includes('-') ? Number(row.date.split('-')[0]) : 2026);
       const year = isNaN(yrMatch) ? 2026 : yrMatch;
       yearCounters[year] = (yearCounters[year] || 0) + 1;
-      const computedPiece = `CSH1/${year}/${String(yearCounters[year]).padStart(5, '0')}`;
+      const computedFallback = `CSH1/${year}/${String(yearCounters[year]).padStart(5, '0')}`;
 
       return {
         id: row.id,
-        pieceComptable: row.piece_comptable || computedPiece,
+        pieceComptable: row.piece_comptable ? String(row.piece_comptable).trim() : computedFallback,
         date: this.formatDate(row.date),
         libelle: row.libelle || '',
         service: row.service || row.type_transaction || '',
@@ -1247,6 +1217,18 @@ export class CashierService implements OnDestroy {
     this._filterState.update((state) => ({
       ...state,
       pageIndex: Math.max(0, index),
+    }));
+  }
+
+  /**
+   * Modifie la taille de la page en imposant strictement un minimum de 80 lignes
+   */
+  public setPageSize(size: number): void {
+    const validSize = Math.max(80, isNaN(size) ? 80 : Number(size));
+    this._filterState.update((state) => ({
+      ...state,
+      pageSize: validSize,
+      pageIndex: 0,
     }));
   }
 
@@ -1372,15 +1354,6 @@ export class CashierService implements OnDestroy {
   }
 
   private formatDate(dateStr: string): string {
-    try {
-      const d = new Date(dateStr);
-      if (isNaN(d.getTime())) return dateStr;
-      const day = String(d.getDate()).padStart(2, '0');
-      const month = String(d.getMonth() + 1).padStart(2, '0');
-      const year = d.getFullYear();
-      return `${day}/${month}/${year}`;
-    } catch {
-      return dateStr;
-    }
+    return formatIsoToDisplayDate(dateStr);
   }
 }

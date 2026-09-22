@@ -1,6 +1,7 @@
 import {
   AfterViewInit,
   ChangeDetectionStrategy,
+  ChangeDetectorRef,
   Component,
   ElementRef,
   OnDestroy,
@@ -33,6 +34,7 @@ import {
 } from 'chart.js';
 import { CashierService } from '../../core/services/cashier.service';
 import { AuthService } from '../../core/services/auth.service';
+import { NotificationService } from '../../core/services/notification.service';
 import {
   CASHIER_SERVICES,
   CashierTransaction,
@@ -40,6 +42,11 @@ import {
   TransactionStatus,
   TransactionTypeCategory,
 } from '../../core/models/cashier-transaction.model';
+import {
+  findDuplicatePieceComptable,
+  findDuplicateTransaction,
+  normalizePieceComptable,
+} from '../../core/utils/cashier-duplicate.util';
 import { OdooDatepicker } from '../../shared/components/odoo-datepicker/odoo-datepicker';
 
 // Enregistrement des composants nécessaires de Chart.js
@@ -77,8 +84,10 @@ export class CashierManagement implements OnInit, AfterViewInit, OnDestroy {
   private readonly caisseChartCanvas?: ElementRef<HTMLCanvasElement>;
 
   public readonly cashierService = inject(CashierService);
+  private readonly notificationService = inject(NotificationService);
   private readonly authService = inject(AuthService);
   private readonly elementRef = inject(ElementRef);
+  private readonly cdr = inject(ChangeDetectorRef);
   protected readonly Math = Math;
   private readonly platformId = inject(PLATFORM_ID);
 
@@ -91,6 +100,28 @@ export class CashierManagement implements OnInit, AfterViewInit, OnDestroy {
   public readonly canEdit = computed(() => {
     const role = this.authService.currentUser()?.role;
     return role === 'admin' || role === 'caissiere';
+  });
+
+  /**
+   * Vérifie si l'utilisateur actuel a le droit d'éditer une transaction spécifique.
+   * - Admin : peut éditer toutes les lignes
+   * - Caissière : ne peut éditer que les lignes qu'elle a elle-même enregistrées ou importées (createdBy === currentUser.id)
+   * - Autres rôles : lecture seule
+   */
+  public canEditTransaction(tx: CashierTransaction): boolean {
+    const user = this.authService.currentUser();
+    if (!user) return false;
+    if (user.role === 'admin') return true;
+    if (user.role !== 'caissiere') return false;
+    // Si la ligne n'a pas encore de créateur spécifié (rétrocompatibilité), autoriser
+    if (!tx.createdBy) return true;
+    return tx.createdBy === user.id;
+  }
+
+  // Sélection de lignes : autorisé pour admin, caissiere et comptable (pour l'exportation et consultation)
+  public readonly canSelect = computed(() => {
+    const role = this.authService.currentUser()?.role;
+    return role === 'admin' || role === 'caissiere' || role === 'comptable';
   });
 
   // Visibilité du solde de caisse en temps réel : masqué pour le rôle comptable
@@ -214,7 +245,7 @@ export class CashierManagement implements OnInit, AfterViewInit, OnDestroy {
       nonNullable: true,
       validators: [Validators.required, Validators.minLength(2)],
     }),
-    service: new FormControl<Service | ''>('', {
+    service: new FormControl<string>('', {
       nonNullable: true,
       validators: [Validators.required],
     }),
@@ -255,7 +286,7 @@ export class CashierManagement implements OnInit, AfterViewInit, OnDestroy {
       nonNullable: true,
       validators: [Validators.required, Validators.minLength(2)],
     }),
-    service: new FormControl<Service | ''>('', {
+    service: new FormControl<string>('', {
       nonNullable: true,
       validators: [Validators.required],
     }),
@@ -280,6 +311,9 @@ export class CashierManagement implements OnInit, AfterViewInit, OnDestroy {
     // Initialisation automatique du formulaire quand l'ajout est déclenché
     effect(() => {
       if (this.cashierService.isAddingRow()) {
+        if (this.editingTxId()) {
+          this.cancelInlineEdit();
+        }
         this.transactionForm.reset({
           date: this.todayIsoDate() || new Date().toISOString().split('T')[0],
           libelle: '',
@@ -310,11 +344,15 @@ export class CashierManagement implements OnInit, AfterViewInit, OnDestroy {
 
     // Écoute dynamique du type de service
     this.transactionForm.get('service')?.valueChanges.subscribe((type) => {
-      this.isOperationsType.set(Boolean(type));
+      const isOperations = type === 'Opérations';
+      this.isOperationsType.set(isOperations);
+      this.updateOperationsValidators(this.transactionForm, isOperations);
     });
 
     this.editTransactionForm.get('service')?.valueChanges.subscribe((type) => {
-      this.isEditOperationsType.set(Boolean(type));
+      const isOperations = type === 'Opérations';
+      this.isEditOperationsType.set(isOperations);
+      this.updateOperationsValidators(this.editTransactionForm, isOperations);
     });
 
     // Conversion automatique si saisie directe d'un montant négatif (ex: -5000 -> catégorie sortie + 5000)
@@ -341,6 +379,22 @@ export class CashierManagement implements OnInit, AfterViewInit, OnDestroy {
         );
       }
     });
+  }
+
+  private updateOperationsValidators(form: FormGroup, isOperations: boolean): void {
+    const dossierControl = form.get('noDossier');
+    const quantityControl = form.get('quantity');
+    if (!dossierControl || !quantityControl) return;
+
+    if (isOperations) {
+      dossierControl.setValidators([Validators.required]);
+      quantityControl.setValidators([Validators.required, Validators.min(1)]);
+    } else {
+      dossierControl.clearValidators();
+      quantityControl.clearValidators();
+    }
+    dossierControl.updateValueAndValidity({ emitEvent: false });
+    quantityControl.updateValueAndValidity({ emitEvent: false });
   }
 
   public readonly todayFormatted = signal<string>('');
@@ -582,6 +636,19 @@ export class CashierManagement implements OnInit, AfterViewInit, OnDestroy {
 
     if (this.transactionForm.invalid) {
       this.transactionForm.markAllAsTouched();
+      const libelleControl = this.transactionForm.get('libelle');
+      const serviceControl = this.transactionForm.get('service');
+      const montantControl = this.transactionForm.get('montant');
+
+      let errorMsg = 'Veuillez renseigner tous les champs obligatoires :';
+      const missing: string[] = [];
+      if (libelleControl?.invalid) missing.push('Libellé (minimum 2 caractères)');
+      if (serviceControl?.invalid) missing.push('Service');
+      if (montantControl?.invalid) missing.push('Montant');
+      errorMsg += ' ' + missing.join(', ') + '.';
+
+      this.cashierService.setError(errorMsg);
+      this.cdr.markForCheck();
       return;
     }
 
@@ -606,7 +673,32 @@ export class CashierManagement implements OnInit, AfterViewInit, OnDestroy {
         }
       }
 
+      // Contrôle strict anti-doublon en direct : Date + Montant + Libellé + N° de dossier + Service
+      const duplicate = findDuplicateTransaction(
+        {
+          date: formattedDate,
+          montant: finalMontant,
+          libelle: formValues.libelle,
+          noDossier: formValues.noDossier,
+          service: formValues.service,
+        },
+        this.allTransactions()
+      );
+
+      if (duplicate) {
+        const montantDisplay = Math.abs(Number(duplicate.montant)).toLocaleString('fr-FR');
+        const serviceDisplay = duplicate.service || 'Sans service';
+        const duplicateMsg = `Opération déjà enregistrée : une opération identique existe déjà en caisse (Date : ${duplicate.date}, Montant : ${montantDisplay} FCFA, Service : ${serviceDisplay}, Libellé : "${duplicate.libelle}"). La double saisie est interdite.`;
+        this.cashierService.setError(duplicateMsg, false);
+        this.cancelAddInline();
+        this.notificationService.warning(duplicateMsg, 'Doublon détecté');
+        return;
+      }
+
+      // Comme sur Odoo, nous ne passons pas de numéro de pièce figé à la création :
+      // le trigger PostgreSQL assigne la pièce officielle de manière atomique et sans trou.
       const result = await this.cashierService.addTransaction({
+        pieceComptable: undefined,
         date: formattedDate,
         libelle: formValues.libelle,
         service: (formValues.service as Service) || undefined,
@@ -621,6 +713,9 @@ export class CashierManagement implements OnInit, AfterViewInit, OnDestroy {
 
       if (result.success) {
         this.cancelAddInline();
+      } else if (result.error) {
+        this.cashierService.setError(result.error);
+        this.cancelAddInline();
       }
     } finally {
       this.isSubmitting.set(false);
@@ -628,7 +723,7 @@ export class CashierManagement implements OnInit, AfterViewInit, OnDestroy {
   }
 
   public async startInlineEdit(tx: CashierTransaction): Promise<void> {
-    if (!this.canEdit()) return;
+    if (!this.canEdit() || !this.canEditTransaction(tx)) return;
     if (this.editingTxId() === tx.id) return;
 
     // Règle d'or : une seule ligne ouverte à la fois.
@@ -725,15 +820,10 @@ export class CashierManagement implements OnInit, AfterViewInit, OnDestroy {
     const target = event.target as HTMLElement | null;
     if (!target) return;
 
-    // Fermer l'erreur de caisse au clic n'importe où
-    if (this.error()) {
-      this.cashierService.clearError();
-    }
-
     // Ignorer si l'élément n'est plus dans le DOM ou fait partie d'un composant flottant (popover, datepicker, dropdown)
     if (
       !document.body.contains(target) ||
-      target.closest('#cashier-new-btn') ||
+      target.closest('#cp-btn-nouveau') ||
       target.closest('app-odoo-datepicker') ||
       target.closest('.odoo-datepicker-popover') ||
       target.closest('.p-dropdown') ||
@@ -746,7 +836,7 @@ export class CashierManagement implements OnInit, AfterViewInit, OnDestroy {
     if (this.isAddingRow()) {
       const addRowEl = this.elementRef.nativeElement.querySelector('#inline-add-row');
       // Si le clic provient de la ligne elle-même ou de ses contrôles internes, ne RIEN faire
-      if (!addRowEl || addRowEl.contains(target) || target.closest('#inline-add-row')) {
+      if (addRowEl && (addRowEl.contains(target) || target.closest('#inline-add-row'))) {
         return;
       }
 
@@ -754,15 +844,9 @@ export class CashierManagement implements OnInit, AfterViewInit, OnDestroy {
       const libelleVal = this.transactionForm.get('libelle')?.value?.trim();
       const rawMontant = this.transactionForm.get('montant')?.value;
       const hasMontant = rawMontant !== null && rawMontant !== undefined && !Number.isNaN(Number(rawMontant));
-      const hasStartedTyping = Boolean(libelleVal) || hasMontant || this.transactionForm.dirty;
-
-      // RÈGLE MÉTIER STRICTE :
-      // - Si les champs obligatoires sont tous les deux remplis et valides -> on enregistre automatiquement.
-      // - Si l'utilisateur a commencé à taper du texte mais n'a pas fini -> NE JAMAIS FERMER LA LIGNE (garder ses saisies intactes).
-      // - Si et seulement si la ligne est totalement vierge et intacte -> on referme sans perte.
       if (libelleVal && hasMontant && Number(rawMontant) !== 0) {
         this.submitInlineTransaction();
-      } else if (!hasStartedTyping) {
+      } else {
         this.cancelAddInline();
       }
       return;
@@ -772,18 +856,16 @@ export class CashierManagement implements OnInit, AfterViewInit, OnDestroy {
     const activeEditId = this.editingTxId();
     if (activeEditId) {
       const editRowEl = this.elementRef.nativeElement.querySelector(`#inline-edit-row-${activeEditId}`);
-      if (!editRowEl || editRowEl.contains(target) || target.closest(`#inline-edit-row-${activeEditId}`)) {
+      if (editRowEl && (editRowEl.contains(target) || target.closest(`#inline-edit-row-${activeEditId}`))) {
         return;
       }
 
       const libelleVal = this.editTransactionForm.get('libelle')?.value?.trim();
       const rawMontant = this.editTransactionForm.get('montant')?.value;
       const hasMontant = rawMontant !== null && rawMontant !== undefined && !Number.isNaN(Number(rawMontant));
-      const hasStartedTyping = Boolean(libelleVal) || hasMontant || this.editTransactionForm.dirty;
-
       if (libelleVal && hasMontant && Number(rawMontant) !== 0) {
         this.submitInlineEdit();
-      } else if (!hasStartedTyping) {
+      } else {
         this.cancelInlineEdit();
       }
     }
@@ -847,8 +929,21 @@ export class CashierManagement implements OnInit, AfterViewInit, OnDestroy {
 
     const formValues = this.editTransactionForm.getRawValue();
     const libelle = formValues.libelle?.trim();
-    if (!libelle) {
-      this.editTransactionForm.get('libelle')?.markAsTouched();
+    if (!libelle || this.editTransactionForm.invalid) {
+      this.editTransactionForm.markAllAsTouched();
+      const libelleControl = this.editTransactionForm.get('libelle');
+      const serviceControl = this.editTransactionForm.get('service');
+      const montantControl = this.editTransactionForm.get('montant');
+
+      let errorMsg = 'Veuillez renseigner tous les champs obligatoires pour la modification :';
+      const missing: string[] = [];
+      if (libelleControl?.invalid) missing.push('Libellé (minimum 2 caractères)');
+      if (serviceControl?.invalid) missing.push('Service');
+      if (montantControl?.invalid) missing.push('Montant');
+      errorMsg += ' ' + missing.join(', ') + '.';
+
+      this.cashierService.setError(errorMsg);
+      this.cdr.markForCheck();
       return;
     }
 
@@ -876,7 +971,45 @@ export class CashierManagement implements OnInit, AfterViewInit, OnDestroy {
         }
       }
 
-      await this.cashierService.updateTransaction(activeId, {
+      // Contrôle strict anti-doublon lors de l'édition
+      const existingTx = this.allTransactions().find((t) => t.id === activeId);
+      const pieceToValidate = normalizePieceComptable(existingTx?.pieceComptable);
+      if (pieceToValidate) {
+        const pieceDuplicate = findDuplicatePieceComptable({ id: activeId, pieceComptable: pieceToValidate }, this.allTransactions());
+        if (pieceDuplicate) {
+          const pieceMsg = `Modification refusée : le numéro de pièce comptable "${pieceToValidate}" est déjà attribué à une autre opération (ID: ${pieceDuplicate.id}, Libellé: "${pieceDuplicate.libelle}").`;
+          this.cashierService.setError(pieceMsg, false);
+          this.cancelInlineEdit();
+          this.notificationService.warning(pieceMsg, 'Pièce comptable en double');
+          return;
+        }
+      }
+
+      const duplicate = findDuplicateTransaction(
+        {
+          id: activeId,
+          date: formattedDate,
+          montant: finalMontant,
+          libelle: libelle,
+          noDossier: formValues.noDossier,
+          service: formValues.service,
+          pieceComptable: pieceToValidate,
+        },
+        this.allTransactions()
+      );
+
+      if (duplicate) {
+        const montantDisplay = Math.abs(Number(duplicate.montant)).toLocaleString('fr-FR');
+        const serviceDisplay = duplicate.service || 'Sans service';
+        const duplicateMsg = `Modification refusée : une opération identique existe déjà en caisse (Date : ${duplicate.date}, Montant : ${montantDisplay} FCFA, Service : ${serviceDisplay}, Libellé : "${duplicate.libelle}").`;
+        this.cashierService.setError(duplicateMsg, false);
+        this.cancelInlineEdit();
+        this.notificationService.warning(duplicateMsg, 'Doublon détecté');
+        return;
+      }
+
+      const updateResult = await this.cashierService.updateTransaction(activeId, {
+        pieceComptable: pieceToValidate,
         date: formattedDate,
         libelle: libelle,
         service: (formValues.service as Service) || '',
@@ -889,11 +1022,20 @@ export class CashierManagement implements OnInit, AfterViewInit, OnDestroy {
         montant: finalMontant,
       });
 
-      // Fermeture automatique du formulaire d'édition pour ne pas bloquer l'UI
-      this.cancelInlineEdit();
+      if (updateResult.success) {
+        this.cancelInlineEdit();
+      } else if (updateResult.message) {
+        this.cashierService.setError(updateResult.message, false);
+        this.cancelInlineEdit();
+      }
     } finally {
       this.isEditingSubmitting.set(false);
     }
+  }
+
+  public dismissError(): void {
+    this.cashierService.clearError();
+    this.cdr.markForCheck();
   }
 
   public onEditKeydown(event: KeyboardEvent): void {
@@ -912,15 +1054,11 @@ export class CashierManagement implements OnInit, AfterViewInit, OnDestroy {
   /**
    * Retourne la référence officielle de pièce comptable séquentielle au format Odoo ERP (ex: CSH1/2026/00001)
    */
-  public getOdooSequence(tx: CashierTransaction, index: number): string {
-    if (tx.pieceComptable) {
-      return tx.pieceComptable;
+  public getOdooSequence(tx: CashierTransaction): string {
+    if (tx.pieceComptable && tx.pieceComptable.trim() !== '') {
+      return tx.pieceComptable.trim();
     }
-    const year = tx.date?.includes('/')
-      ? tx.date.split('/')[2] || '2026'
-      : (tx.date?.includes('-') ? tx.date.split('-')[0] : '2026');
-    const seqNum = String(index + 1).padStart(5, '0');
-    return `CSH1/${year}/${seqNum}`;
+    return '-';
   }
 
   /**

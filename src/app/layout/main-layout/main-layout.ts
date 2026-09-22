@@ -7,6 +7,9 @@ import { ROLE_DEFINITIONS, UserRole } from '../../core/models/auth.model';
 import { AuthService } from '../../core/services/auth.service';
 import { CashierService } from '../../core/services/cashier.service';
 import { ThemeService } from '../../core/services/theme.service';
+import { NotificationService } from '../../core/services/notification.service';
+import { CashierImportModal } from '../../features/cashier/import-modal/cashier-import-modal.component';
+import { ParsedImportRow } from '../../core/services/import.service';
 
 export interface NavOption {
   id: string;
@@ -18,7 +21,7 @@ export interface NavOption {
 
 @Component({
   selector: 'app-main-layout',
-  imports: [RouterOutlet, RouterLink, RouterLinkActive, MatIconModule],
+  imports: [RouterOutlet, RouterLink, RouterLinkActive, MatIconModule, CashierImportModal],
   templateUrl: './main-layout.html',
   styleUrl: './main-layout.scss',
   changeDetection: ChangeDetectionStrategy.OnPush,
@@ -31,6 +34,7 @@ export class MainLayout {
   public readonly authService = inject(AuthService);
   public readonly cashierService = inject(CashierService);
   public readonly themeService = inject(ThemeService);
+  public readonly notificationService = inject(NotificationService);
   public readonly router = inject(Router);
 
   public readonly currentUser = this.authService.currentUser;
@@ -261,6 +265,36 @@ export class MainLayout {
       void this.router.navigate(['/caisse']);
     }
     this.cashierService.startAddTransaction();
+  }
+
+  public onOpenImportModal(): void {
+    if (!this.router.url.includes('/caisse')) {
+      void this.router.navigate(['/caisse']);
+    }
+    this.cashierService.openImportModal();
+  }
+
+  public async onImportConfirmed(rows: ParsedImportRow[]): Promise<void> {
+    this.cashierService.closeImportModal();
+    const result = await this.cashierService.importTransactions(rows);
+    if (result.insertedCount > 0) {
+      this.notificationService.success(
+        `${result.insertedCount} transaction(s) importée(s) avec succès avec numéros de pièce attribués par le serveur.${result.duplicateCount > 0 ? ` (${result.duplicateCount} doublon(s) ignoré(s))` : ''}`,
+        'Import réussi'
+      );
+    } else if (result.duplicateCount > 0 && result.insertedCount === 0) {
+      this.notificationService.info(
+        `Aucune nouvelle transaction importée : les ${result.duplicateCount} transaction(s) existent déjà en base de données (doublons).`,
+        'Transactions existantes'
+      );
+    }
+
+    if (result.errors.length > 0) {
+      console.warn('Importation avec alertes:', result.errors);
+      const message = result.errors.slice(0, 3).join(' ');
+      const isDuplicate = result.errors.some((error) => error.toLowerCase().includes('doublon'));
+      this.notificationService.warning(message, isDuplicate ? 'Doublon détecté' : 'Erreurs lors de l’import');
+    }
   }
 
   public prevPage(): void {

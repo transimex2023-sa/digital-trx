@@ -209,8 +209,6 @@ export class AuthService {
 
       const appRole = authUser?.app_metadata?.['role'] as UserRole | undefined;
       const profileRole = profile?.role as UserRole | undefined;
-      const userMetaRole = authUser?.user_metadata?.['role'] as UserRole | undefined;
-
       // Résolution sécurisée du rôle :
       // 1. Si app_metadata (scellé serveur par Supabase Admin) ou profile (table SQL sécurisée) spécifie 'admin' => 'admin'
       // 2. user_metadata n'est jamais utilisé pour élever les privilèges admin (modifiable côté client)
@@ -218,7 +216,7 @@ export class AuthService {
       if (appRole === 'admin' || profileRole === 'admin') {
         targetRole = 'admin';
       } else {
-        targetRole = normalizeUserRole(appRole || profileRole || userMetaRole || 'employe');
+        targetRole = normalizeUserRole(appRole || profileRole || 'employe');
       }
 
       const resolvedRole: UserRole = targetRole;
@@ -325,30 +323,19 @@ export class AuthService {
 
     try {
       if (this.checkSupabaseConfigured() && this.supabaseService.supabase) {
-        const { data, error } = await this.supabaseService.supabase.auth.signUp({
+        const { error } = await this.supabaseService.supabase.auth.signUp({
           email: email.trim().toLowerCase(),
           password,
           options: {
             data: {
               first_name: profileData.firstName,
               last_name: profileData.lastName,
-              role: profileData.role || 'employe',
             },
           },
         });
 
         if (error) throw error;
 
-        if (data.user) {
-          await this.supabaseService.supabase.from('profiles').upsert({
-            id: data.user.id,
-            email: email.trim().toLowerCase(),
-            first_name: profileData.firstName || '',
-            last_name: profileData.lastName || '',
-            role: profileData.role || 'employe',
-            is_active: true,
-          });
-        }
       }
 
       this._isLoading.set(false);
@@ -361,6 +348,48 @@ export class AuthService {
       this._authError.set(msg);
       this._isLoading.set(false);
       return { success: false, error: msg };
+    }
+  }
+
+  public async updatePassword(currentPassword: string, newPassword: string): Promise<{ success: boolean; error?: string }> {
+    try {
+      await this.supabaseService.ensureInitialized();
+
+      if (!this.checkSupabaseConfigured() || !this.supabaseService.supabase) {
+        return { success: false, error: 'Le service Supabase n’est pas configuré.' };
+      }
+
+      const current = this._currentUser();
+      if (!current?.email) {
+        return { success: false, error: 'Utilisateur non connecté.' };
+      }
+
+      const { error: signInError } = await this.supabaseService.supabase.auth.signInWithPassword({
+        email: current.email,
+        password: currentPassword,
+      });
+
+      if (signInError) {
+        return {
+          success: false,
+          error: 'Le mot de passe actuel est incorrect.',
+        };
+      }
+
+      const { error: updateError } = await this.supabaseService.supabase.auth.updateUser({
+        password: newPassword,
+      });
+
+      if (updateError) {
+        return { success: false, error: updateError.message };
+      }
+
+      return { success: true };
+    } catch (err: unknown) {
+      return {
+        success: false,
+        error: err instanceof Error ? err.message : 'Impossible de modifier le mot de passe.',
+      };
     }
   }
 

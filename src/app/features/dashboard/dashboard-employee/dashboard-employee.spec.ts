@@ -1,9 +1,11 @@
+import { describe, it, expect, beforeEach } from 'vitest';
 import { ComponentFixture, TestBed } from '@angular/core/testing';
 import { provideRouter } from '@angular/router';
 import { signal } from '@angular/core';
 import { DashboardEmployee } from './dashboard-employee';
 import { AuthService } from '../../../core/services/auth.service';
 import { UserProfile } from '../../../core/models/auth.model';
+import { CashierService } from '../../../core/services/cashier.service';
 
 describe('DashboardEmployee', () => {
   let component: DashboardEmployee;
@@ -21,6 +23,14 @@ describe('DashboardEmployee', () => {
 
   const authServiceMock = {
     currentUser: signal<UserProfile | null>(mockEmployeeUser),
+    token: () => 'mock-jwt-token',
+    isAuthenticated: () => true,
+    waitForSession: () => Promise.resolve(),
+  };
+
+  const cashierServiceMock = {
+    currentBalance: signal(0),
+    allTransactions: signal([]),
   };
 
   beforeEach(async () => {
@@ -29,6 +39,7 @@ describe('DashboardEmployee', () => {
       providers: [
         provideRouter([]),
         { provide: AuthService, useValue: authServiceMock },
+        { provide: CashierService, useValue: cashierServiceMock },
       ],
     }).compileComponents();
 

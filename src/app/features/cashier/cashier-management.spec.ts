@@ -3,18 +3,24 @@ import { CashierManagement } from './cashier-management';
 import { CashierService } from '../../core/services/cashier.service';
 import { SupabaseService } from '../../core/services/supabase.service';
 import { AuthService } from '../../core/services/auth.service';
+import { NotificationService } from '../../core/services/notification.service';
+import { vi } from 'vitest';
 
 describe('CashierManagement', () => {
   let component: CashierManagement;
   let fixture: ComponentFixture<CashierManagement>;
   let service: CashierService;
+  let notificationService: NotificationService;
+  let originalFetch: typeof globalThis.fetch;
 
   beforeEach(async () => {
+    originalFetch = globalThis.fetch;
     await TestBed.configureTestingModule({
       imports: [CashierManagement],
       providers: [
         CashierService,
         SupabaseService,
+        NotificationService,
         {
           provide: AuthService,
           useValue: {
@@ -25,10 +31,50 @@ describe('CashierManagement', () => {
       ],
     }).compileComponents();
 
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes('/api/supabase-config')) {
+        return new Response(JSON.stringify({ configured: false }), { status: 200 });
+      }
+
+      const method = init?.method || 'GET';
+      if (method === 'GET') {
+        return new Response(JSON.stringify({ operations: [] }), { status: 200 });
+      }
+
+      if (method === 'POST') {
+        const body = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>;
+        const category = body['category'] === 'sortie' ? 'sortie' : 'entree';
+        const amount = Number(body['montant'] || 0);
+        return new Response(JSON.stringify({
+          success: true,
+          operation: {
+            id: `test-operation-${Date.now()}`,
+            date: body['date'] || '2026-09-20',
+            libelle: body['libelle'],
+            service: body['service'],
+            category,
+            status: body['status'] || 'draft',
+            no_dossier: body['noDossier'] || null,
+            employee: body['employee'] || null,
+            quantity: body['quantity'] || null,
+            montant: category === 'sortie' ? -Math.abs(amount) : Math.abs(amount),
+          },
+        }), { status: 201 });
+      }
+
+      return new Response(JSON.stringify({ success: true }), { status: 200 });
+    }) as typeof globalThis.fetch;
+
     fixture = TestBed.createComponent(CashierManagement);
     component = fixture.componentInstance;
     service = TestBed.inject(CashierService);
+    notificationService = TestBed.inject(NotificationService);
     fixture.detectChanges();
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
   });
 
   it('devrait créer le composant', () => {
@@ -189,5 +235,42 @@ describe('CashierManagement', () => {
     await component.submitInlineEdit();
     const updatedTx = service.allTransactions()[0];
     expect(updatedTx.status).toBe('draft');
+  });
+
+  it('devrait afficher une notification d’avertissement lors de la détection d’un doublon', async () => {
+    vi.spyOn(notificationService, 'warning');
+
+    // 1. Ajouter une première transaction
+    component.startAddInline();
+    component.transactionForm.patchValue({
+      date: '18/09/2026',
+      libelle: 'Paiement fournisseur pièces',
+      category: 'sortie',
+      montant: 50000,
+      service: 'Administration',
+    });
+    await component.submitInlineTransaction();
+
+    expect(service.allTransactions().length).toBe(1);
+
+    // 2. Tenter d'ajouter exactement la même transaction (même date, montant, libellé, service)
+    component.startAddInline();
+    component.transactionForm.patchValue({
+      date: '18/09/2026',
+      libelle: 'Paiement fournisseur pièces',
+      category: 'sortie',
+      montant: 50000,
+      service: 'Administration',
+    });
+    await component.submitInlineTransaction();
+
+    // La transaction en doublon ne doit pas être insérée
+    expect(service.allTransactions().length).toBe(1);
+    // NotificationService.warning doit avoir été appelé avec un titre explicite
+    expect(notificationService.warning).toHaveBeenCalledWith(
+      expect.stringMatching(/Opération déjà enregistrée/),
+      'Doublon détecté'
+    );
+    expect(component.error()).toContain('Opération déjà enregistrée');
   });
 });
