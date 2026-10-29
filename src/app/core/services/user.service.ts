@@ -1,8 +1,10 @@
-import { Injectable, computed, inject, signal, PLATFORM_ID } from '@angular/core';
+import { Injectable, computed, effect, inject, signal, PLATFORM_ID } from '@angular/core';
 import { isPlatformBrowser } from '@angular/common';
 import { CreateUserPayload, UpdateUserPayload, UserProfile } from '../models/auth.model';
 import { SupabaseService } from './supabase.service';
+import { AuthService } from './auth.service';
 import { normalizeUserRole } from '../utils/role.utils';
+import { getApiErrorMessage } from '../utils/api-error.util';
 
 const USERS_STORAGE_KEY = 'transmex_users_store';
 
@@ -11,8 +13,10 @@ const USERS_STORAGE_KEY = 'transmex_users_store';
 })
 export class UserService {
   private readonly supabaseService = inject(SupabaseService);
+  private readonly authService = inject(AuthService);
   private readonly platformId = inject(PLATFORM_ID);
   private readonly isBrowser = isPlatformBrowser(this.platformId);
+  private usersLoadedForUserId: string | null = null;
 
   private checkSupabaseConfigured(): boolean {
     const configured = this.supabaseService.isConfigured;
@@ -22,8 +26,30 @@ export class UserService {
     return Boolean(configured);
   }
 
+  private getOperationError(error: unknown, fallback: string, networkMessage: string): string {
+    if (error instanceof TypeError) return networkMessage;
+    if (error instanceof Error && error.message.trim()) return error.message.trim();
+    return fallback;
+  }
+
+  private async readApiPayload(response: Response): Promise<unknown> {
+    try {
+      return await response.json();
+    } catch {
+      return null;
+    }
+  }
+
+  private async readApiError(response: Response, fallback: string): Promise<string> {
+    return getApiErrorMessage(await this.readApiPayload(response), fallback);
+  }
+
   private async getAuthToken(): Promise<string> {
     if (!this.isBrowser) return '';
+
+    // 1. Récupération prioritaire depuis le signal d'authentification réactif AuthService
+    const authSignalToken = this.authService.token();
+    if (authSignalToken) return authSignalToken;
 
     try {
       if (this.checkSupabaseConfigured() && this.supabaseService.supabase) {
@@ -33,9 +59,6 @@ export class UserService {
           return sessionData.session.access_token;
         }
       }
-
-      const cachedToken = localStorage.getItem('transmex_auth_token');
-      if (cachedToken) return cachedToken;
 
       // Chercher aussi les tokens sb-*-auth-token stockés automatiquement par Supabase
       for (let i = 0; i < localStorage.length; i++) {
@@ -73,124 +96,80 @@ export class UserService {
   public readonly employeCount = computed(() => this._users().filter((u) => u.role === 'employe').length);
 
   constructor() {
-    this.restoreFromStorage();
-    this.loadInitialUsers();
-  }
-
-  private restoreFromStorage(): void {
-    if (this.isBrowser) {
-      try {
-        const stored = localStorage.getItem(USERS_STORAGE_KEY);
-        if (stored) {
-          const parsed = JSON.parse(stored);
-          if (Array.isArray(parsed) && parsed.length > 0) {
-            this._users.set(parsed);
-          }
-        }
-      } catch {
-        // Ignorer
+    this.clearAllUsers();
+    effect(() => {
+      const userId = this.authService.currentUser()?.id ?? null;
+      if (this.usersLoadedForUserId !== userId) {
+        this.usersLoadedForUserId = userId;
+        this.clearAllUsers();
       }
-    }
+    });
   }
 
   /**
-   * Charge la liste des utilisateurs depuis le stockage ou Supabase
+   * Charge la liste des utilisateurs depuis l’API serveur.
    */
   public async loadInitialUsers(): Promise<void> {
+    const requestedUserId = this.authService.currentUser()?.id ?? null;
+    this.usersLoadedForUserId = requestedUserId;
+    this.clearAllUsers();
     this._isLoading.set(true);
     this._error.set(null);
 
     try {
-      // 1. Tenter l'appel à l'API sécurisée /api/system/collaborators avec le Bearer token admin
-      if (this.isBrowser) {
-        try {
-          const authToken = await this.getAuthToken();
-          const headers: Record<string, string> = {};
-          if (authToken) {
-            headers['Authorization'] = `Bearer ${authToken}`;
-          }
-
-          const res = await fetch('/api/system/collaborators', { method: 'GET', headers });
-          if (res.ok) {
-            const data = await res.json();
-            if (data?.users && Array.isArray(data.users)) {
-              const mapped: UserProfile[] = data.users.map((row: UserProfile) => {
-                const resolvedRole = normalizeUserRole(row.role);
-                return {
-                  id: row.id,
-                  email: row.email,
-                  firstName: row.firstName || 'Utilisateur',
-                  lastName: row.lastName || 'Transmex',
-                  role: resolvedRole,
-                  department: row.department || 'Services Généraux',
-                  phone: row.phone,
-                  isActive: row.isActive ?? true,
-                  avatarUrl: row.avatarUrl,
-                  createdAt: row.createdAt || new Date().toISOString(),
-                  lastLoginAt: row.lastLoginAt,
-                };
-              });
-
-              this._users.set(mapped);
-              this.saveToStorage(mapped);
-              this._isLoading.set(false);
-              return;
-            }
-          }
-        } catch {
-          // Ignorer et passer aux modes de secours
-        }
+      if (!this.isBrowser) {
+        return;
       }
 
-      if (this.checkSupabaseConfigured() && this.supabaseService.supabase) {
-        const { data, error } = await this.supabaseService.supabase
-          .from('profiles')
-          .select('*')
-          .order('created_at', { ascending: false });
-
-        if (error) {
-          throw error;
-        }
-
-        if (data) {
-          const mapped: UserProfile[] = data.map((row) => {
-            const resolvedRole = normalizeUserRole(row.role);
-            return {
-              id: row.id,
-              email: row.email,
-              firstName: row.first_name || 'Utilisateur',
-              lastName: row.last_name || 'Transmex',
-              role: resolvedRole,
-              department: row.department || 'Services Généraux',
-              phone: row.phone,
-              isActive: row.is_active ?? true,
-              avatarUrl: row.avatar_url,
-              createdAt: row.created_at,
-              lastLoginAt: row.last_sign_in_at || undefined,
-            };
-          });
-
-          this._users.set(mapped);
-          this.saveToStorage(mapped);
-          this._isLoading.set(false);
-          return;
-        }
+      const authToken = await this.getAuthToken();
+      if (!authToken) {
+        this._isLoading.set(false);
+        return;
       }
 
-      // Si aucune donnée n'est récupérée mais qu'il y avait déjà des utilisateurs en cache, les préserver
-      if (this._users().length === 0) {
-        if (this.isBrowser) {
-          localStorage.removeItem(USERS_STORAGE_KEY);
-        }
-        this._users.set([]);
+      const headers: Record<string, string> = {
+        Authorization: `Bearer ${authToken}`,
+      };
+
+      const res = await fetch('/api/system/collaborators', { method: 'GET', headers });
+      if (!res.ok) {
+        throw new Error(await this.readApiError(
+          res,
+          `Impossible de charger les utilisateurs (erreur HTTP ${res.status}).`
+        ));
       }
+
+      const data = await res.json();
+      if (!data?.users || !Array.isArray(data.users)) {
+        throw new Error('Réponse invalide du serveur de gestion des utilisateurs.');
+      }
+
+      if ((this.authService.currentUser()?.id ?? null) !== requestedUserId) return;
+
+      const mapped: UserProfile[] = data.users.map((row: UserProfile) => ({
+        id: row.id,
+        email: row.email,
+        firstName: row.firstName || 'Utilisateur',
+        lastName: row.lastName || 'Transmex',
+        role: normalizeUserRole(row.role),
+        customRole: row.customRole || null,
+        roleLabel: row.roleLabel || null,
+        department: row.department || 'Services Généraux',
+        phone: row.phone,
+        isActive: row.isActive ?? true,
+        avatarUrl: row.avatarUrl,
+        createdAt: row.createdAt || new Date().toISOString(),
+        lastLoginAt: row.lastLoginAt,
+      }));
+
+      this._users.set(mapped);
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Erreur lors du chargement des utilisateurs';
+      const msg = this.getOperationError(
+        err,
+        'Impossible de charger les utilisateurs. Veuillez réessayer.',
+        'Connexion au service de gestion des utilisateurs impossible. Vérifiez votre connexion puis réessayez.'
+      );
       this._error.set(msg);
-      // Ne pas écraser les données locales si une erreur survient
-      if (this._users().length === 0) {
-        this._users.set([]);
-      }
     } finally {
       this._isLoading.set(false);
     }
@@ -246,36 +225,59 @@ export class UserService {
         }),
       });
 
-      const data = await res.json();
+      const data = await this.readApiPayload(res);
       if (!res.ok) {
-        throw new Error(data?.error || `Erreur serveur (${res.status}) lors de la création de l'utilisateur.`);
+        throw new Error(getApiErrorMessage(
+          data,
+          `Impossible de créer l’utilisateur (erreur HTTP ${res.status}).`
+        ));
       }
 
-      if (!data?.user) {
+      if (
+        typeof data !== 'object'
+        || data === null
+        || !('user' in data)
+        || typeof data.user !== 'object'
+        || data.user === null
+      ) {
         throw new Error('Réponse invalide du serveur de synchronisation.');
       }
+      const userData = data.user as Record<string, unknown>;
+      if (
+        typeof userData['id'] !== 'string'
+        || typeof userData['email'] !== 'string'
+        || typeof userData['firstName'] !== 'string'
+        || typeof userData['lastName'] !== 'string'
+        || typeof userData['role'] !== 'string'
+      ) {
+        throw new Error('Réponse invalide du serveur de synchronisation.');
+      }
+      const role = normalizeUserRole(userData['role']);
 
       const newUser: UserProfile = {
-        id: data.user.id,
-        email: data.user.email,
-        firstName: data.user.firstName,
-        lastName: data.user.lastName,
-        role: data.user.role,
-        roles: [data.user.role],
-        department: data.user.department,
-        phone: data.user.phone,
-        isActive: data.user.isActive ?? true,
-        createdAt: data.user.createdAt || new Date().toISOString(),
+        id: userData['id'],
+        email: userData['email'],
+        firstName: userData['firstName'],
+        lastName: userData['lastName'],
+        role,
+        roles: [role],
+        department: typeof userData['department'] === 'string' ? userData['department'] : undefined,
+        phone: typeof userData['phone'] === 'string' ? userData['phone'] : undefined,
+        isActive: typeof userData['isActive'] === 'boolean' ? userData['isActive'] : true,
+        createdAt: typeof userData['createdAt'] === 'string' ? userData['createdAt'] : new Date().toISOString(),
       };
 
       const updatedList = [newUser, ...this._users()];
       this._users.set(updatedList);
-      this.saveToStorage(updatedList);
       this._isLoading.set(false);
 
       return { success: true, user: newUser };
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Erreur lors de la création du compte';
+      const msg = this.getOperationError(
+        err,
+        'Impossible de créer l’utilisateur. Veuillez réessayer.',
+        'Connexion au service de gestion des utilisateurs impossible pour créer le compte. Vérifiez votre connexion puis réessayez.'
+      );
       this._error.set(msg);
       this._isLoading.set(false);
       return { success: false, error: msg };
@@ -306,15 +308,18 @@ export class UserService {
         body: JSON.stringify(payload),
       });
 
-      const data = await res.json().catch(() => null);
       if (!res.ok) {
-        throw new Error(data?.error || `Erreur serveur (${res.status})`);
+        throw new Error(await this.readApiError(res, `Impossible de mettre à jour le profil (erreur HTTP ${res.status}).`));
       }
 
       this._isLoading.set(false);
       return { success: true };
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Erreur lors de la mise à jour du profil';
+      const msg = this.getOperationError(
+        err,
+        'Impossible de mettre à jour le profil. Veuillez réessayer.',
+        'Connexion au service de profil impossible. Vérifiez votre connexion puis réessayez.'
+      );
       this._error.set(msg);
       this._isLoading.set(false);
       return { success: false, error: msg };
@@ -329,102 +334,31 @@ export class UserService {
     this._error.set(null);
 
     try {
-      let updateSucceeded = false;
-      let lastErrorMessage = '';
+      if (!this.isBrowser) throw new Error('La mise à jour nécessite un navigateur authentifié.');
 
-      if (this.isBrowser) {
-        try {
-          const authToken = await this.getAuthToken();
-          const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-          if (authToken) {
-            headers['Authorization'] = `Bearer ${authToken}`;
-          }
-
-          const res = await fetch(`/api/system/collaborators/${id}`, {
-            method: 'PATCH',
-            headers,
-            body: JSON.stringify(payload),
-          });
-
-          if (res.ok) {
-            updateSucceeded = true;
-          } else {
-            const errData = await res.json().catch(() => null);
-            lastErrorMessage = errData?.error || `Erreur serveur (${res.status})`;
-          }
-        } catch (fetchErr) {
-          lastErrorMessage = fetchErr instanceof Error ? fetchErr.message : 'Erreur de connexion';
-        }
-      }
-
-      // Repli direct Supabase si l'API Express n'a pas pu être atteinte.
-      // IMPORTANT : jamais pour un changement de rôle. Seule l'API serveur (clé service_role)
-      // met à jour auth.users.app_metadata.role, qui est la source de vérité prioritaire côté
-      // serveur (resolveServerRole) et dans la liste des collaborateurs. Un repli qui ne touche
-      // que public.profiles.role laisserait l'ancien rôle "scellé" dans app_metadata reprendre
-      // le dessus, et donnerait l'impression trompeuse que le changement n'a pas été enregistré.
-      if (!updateSucceeded && payload.role !== undefined) {
-        throw new Error(
-          lastErrorMessage ||
-            "Le changement de rôle nécessite le service d'administration serveur, actuellement injoignable. Réessayez."
-        );
-      }
-
-      if (!updateSucceeded && this.checkSupabaseConfigured() && this.supabaseService.supabase) {
-        const updateData: Record<string, unknown> = {};
-        if (payload.firstName !== undefined) updateData['first_name'] = payload.firstName;
-        if (payload.lastName !== undefined) updateData['last_name'] = payload.lastName;
-        if (payload.department !== undefined) updateData['department'] = payload.department;
-        if (payload.phone !== undefined) updateData['phone'] = payload.phone;
-        if (payload.isActive !== undefined) updateData['is_active'] = payload.isActive;
-        if (payload.avatarUrl !== undefined) updateData['avatar_url'] = payload.avatarUrl;
-
-        // .select('id') est indispensable ici : sans lui, un UPDATE bloqué par une policy RLS
-        // (0 ligne affectée) renvoie quand même error === null, et le code affichait alors
-        // un succès trompeur alors que rien n'avait été écrit en base.
-        const { data: directData, error: directErr } = await this.supabaseService.supabase
-          .from('profiles')
-          .update(updateData)
-          .eq('id', id)
-          .select('id');
-
-        if (!directErr && directData && directData.length > 0) {
-          updateSucceeded = true;
-        } else if (!directErr && (!directData || directData.length === 0)) {
-          lastErrorMessage = lastErrorMessage || 'Aucune ligne modifiée (droits insuffisants ou compte introuvable).';
-        } else if (directErr && !lastErrorMessage) {
-          lastErrorMessage = directErr.message;
-        }
-      }
-
-      if (!updateSucceeded) {
-        throw new Error(lastErrorMessage || 'Échec de l’enregistrement du rôle en base de données.');
-      }
-
-      const updatedList = this._users().map((u) => {
-        if (u.id === id) {
-          return {
-            ...u,
-            firstName: payload.firstName ?? u.firstName,
-            lastName: payload.lastName ?? u.lastName,
-            role: payload.role ?? u.role,
-            roles: payload.role ? [payload.role] : u.roles,
-            department: payload.department ?? u.department,
-            phone: payload.phone ?? u.phone,
-            isActive: payload.isActive ?? u.isActive,
-            avatarUrl: payload.avatarUrl ?? u.avatarUrl,
-          };
-        }
-        return u;
+      const authToken = await this.getAuthToken();
+      const res = await fetch(`/api/system/collaborators/${id}`, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+        },
+        body: JSON.stringify(payload),
       });
+      if (!res.ok) {
+        throw new Error(await this.readApiError(res, `Impossible de mettre à jour l’utilisateur (erreur HTTP ${res.status}).`));
+      }
 
-      this._users.set(updatedList);
-      this.saveToStorage(updatedList);
+      await this.loadInitialUsers();
       this._isLoading.set(false);
 
       return { success: true };
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Erreur lors de la mise à jour';
+      const msg = this.getOperationError(
+        err,
+        'Impossible de mettre à jour l’utilisateur. Veuillez réessayer.',
+        'Connexion au service de gestion des utilisateurs impossible pour mettre à jour ce compte. Vérifiez votre connexion puis réessayez.'
+      );
       this._error.set(msg);
       this._isLoading.set(false);
       return { success: false, error: msg };
@@ -445,37 +379,28 @@ export class UserService {
    */
   public async deleteUser(id: string): Promise<{ success: boolean; error?: string }> {
     this._isLoading.set(true);
+    this._error.set(null);
     try {
-      if (this.isBrowser) {
-        try {
-          let authToken = '';
-          if (this.checkSupabaseConfigured() && this.supabaseService.supabase) {
-            const { data: sessionData } = await this.supabaseService.supabase.auth.getSession();
-            authToken = sessionData.session?.access_token || '';
-          }
+      if (!this.isBrowser) throw new Error('La suppression nécessite un navigateur authentifié.');
 
-          const headers: Record<string, string> = {};
-          if (authToken) {
-            headers['Authorization'] = `Bearer ${authToken}`;
-          }
-
-          await fetch(`/api/system/collaborators/${id}`, { method: 'DELETE', headers });
-        } catch {
-          // Si endpoint indisponible (mode test), continuer
-        }
+      const authToken = await this.getAuthToken();
+      const res = await fetch(`/api/system/collaborators/${id}`, {
+        method: 'DELETE',
+        headers: authToken ? { Authorization: `Bearer ${authToken}` } : {},
+      });
+      if (!res.ok) {
+        throw new Error(await this.readApiError(res, `Impossible de supprimer l’utilisateur (erreur HTTP ${res.status}).`));
       }
 
-      if (this.checkSupabaseConfigured() && this.supabaseService.supabase) {
-        await this.supabaseService.supabase.from('profiles').delete().eq('id', id);
-      }
-
-      const updatedList = this._users().filter((u) => u.id !== id);
-      this._users.set(updatedList);
-      this.saveToStorage(updatedList);
+      await this.loadInitialUsers();
       this._isLoading.set(false);
       return { success: true };
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Erreur lors de la suppression';
+      const msg = this.getOperationError(
+        err,
+        'Impossible de supprimer l’utilisateur. Veuillez réessayer.',
+        'Connexion au service de gestion des utilisateurs impossible pour supprimer ce compte. Vérifiez votre connexion puis réessayez.'
+      );
       this._error.set(msg);
       this._isLoading.set(false);
       return { success: false, error: msg };
@@ -496,13 +421,4 @@ export class UserService {
     }
   }
 
-  private saveToStorage(list: UserProfile[]): void {
-    if (this.isBrowser) {
-      try {
-        localStorage.setItem(USERS_STORAGE_KEY, JSON.stringify(list));
-      } catch {
-        // Ignorer
-      }
-    }
-  }
 }

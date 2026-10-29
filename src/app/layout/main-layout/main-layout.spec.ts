@@ -1,15 +1,20 @@
-import { TestBed } from '@angular/core/testing';
+import { ComponentFixture, TestBed } from '@angular/core/testing';
 import { provideRouter } from '@angular/router';
 import { signal } from '@angular/core';
 import { MainLayout } from './main-layout';
 import { AuthService } from '../../core/services/auth.service';
+import { AccessControlService } from '../../core/services/access-control.service';
 import { CashierService } from '../../core/services/cashier.service';
+import { Journal } from '../../core/models/journal.model';
+import { JournalService } from '../../core/services/journal.service';
 import { SupabaseService } from '../../core/services/supabase.service';
 import { ThemeService } from '../../core/services/theme.service';
-import { UserProfile } from '../../core/models/auth.model';
+import { UserProfile, UserRole } from '../../core/models/auth.model';
+import { vi } from 'vitest';
 
 describe('MainLayout Component', () => {
   let component: MainLayout;
+  let fixture: ComponentFixture<MainLayout>;
   let cashierService: CashierService;
   let themeService: ThemeService;
   let logoutCalled = false;
@@ -24,13 +29,38 @@ describe('MainLayout Component', () => {
     createdAt: new Date().toISOString(),
   };
 
+  let currentUser = signal<UserProfile | null>(mockUser);
+  let currentRole = signal<UserRole>(mockUser.role);
+  let effectivePermissions = signal([
+    { permissionKey: 'module.dashboard.view', scope: { type: 'all', version: 1 }, effect: 'allow' as const },
+    { permissionKey: 'module.accounting.view', scope: { type: 'all', version: 1 }, effect: 'allow' as const },
+    { permissionKey: 'cashier.create', scope: { type: 'all', version: 1 }, effect: 'allow' as const },
+    { permissionKey: 'module.prospects.view', scope: { type: 'all', version: 1 }, effect: 'allow' as const },
+    { permissionKey: 'module.hr.view', scope: { type: 'all', version: 1 }, effect: 'allow' as const },
+    { permissionKey: 'module.access_control.view', scope: { type: 'all', version: 1 }, effect: 'allow' as const },
+    { permissionKey: 'module.configuration.view', scope: { type: 'all', version: 1 }, effect: 'allow' as const },
+  ]);
+
   beforeEach(() => {
     logoutCalled = false;
+    currentUser = signal<UserProfile | null>(mockUser);
+    currentRole = signal<UserRole>(mockUser.role);
+    effectivePermissions = signal([
+      { permissionKey: 'module.dashboard.view', scope: { type: 'all', version: 1 }, effect: 'allow' as const },
+      { permissionKey: 'module.accounting.view', scope: { type: 'all', version: 1 }, effect: 'allow' as const },
+      { permissionKey: 'cashier.create', scope: { type: 'all', version: 1 }, effect: 'allow' as const },
+      { permissionKey: 'module.prospects.view', scope: { type: 'all', version: 1 }, effect: 'allow' as const },
+      { permissionKey: 'module.hr.view', scope: { type: 'all', version: 1 }, effect: 'allow' as const },
+      { permissionKey: 'module.access_control.view', scope: { type: 'all', version: 1 }, effect: 'allow' as const },
+      { permissionKey: 'module.configuration.view', scope: { type: 'all', version: 1 }, effect: 'allow' as const },
+    ]);
     TestBed.configureTestingModule({
       imports: [MainLayout],
       providers: [
         provideRouter([
           { path: 'caisse', component: MainLayout },
+          { path: 'dossiers', component: MainLayout },
+          { path: 'configuration', component: MainLayout },
           { path: '**', component: MainLayout },
         ]),
         CashierService,
@@ -38,7 +68,9 @@ describe('MainLayout Component', () => {
         {
           provide: AuthService,
           useValue: {
-            currentUser: signal<UserProfile | null>(mockUser),
+            currentUser,
+            currentRole,
+            token: signal('mock-jwt-token'),
             logout: () => {
               logoutCalled = true;
               return Promise.resolve();
@@ -49,10 +81,23 @@ describe('MainLayout Component', () => {
           provide: SupabaseService,
           useValue: { isConfigured: () => false, supabase: null },
         },
+        {
+          provide: AccessControlService,
+          useValue: {
+            effectivePermissions,
+            hasPermission: (permission: string) => {
+              if (permission === 'cashier.create') return currentRole() === 'admin' || currentRole() === 'caissiere';
+              return effectivePermissions().some((item) => item.permissionKey === permission && item.effect === 'allow');
+            },
+            hasPermissionForResource: (_permission: string, resource: { ownerUserId?: string }) =>
+              resource.ownerUserId === currentUser()?.id,
+            loadMyPermissions: vi.fn().mockResolvedValue(undefined),
+          },
+        },
       ],
     });
 
-    const fixture = TestBed.createComponent(MainLayout);
+    fixture = TestBed.createComponent(MainLayout);
     component = fixture.componentInstance;
     cashierService = TestBed.inject(CashierService);
     themeService = TestBed.inject(ThemeService);
@@ -62,16 +107,32 @@ describe('MainLayout Component', () => {
     expect(component).toBeTruthy();
   });
 
-  it('devrait filtrer les éléments de la navigation selon le rôle', () => {
+  it('devrait filtrer les éléments de la navigation selon le rôle et inclure la configuration', () => {
     const items = component.visibleMenuItems();
     expect(items.length).toBeGreaterThan(0);
     expect(items.some((i) => i.route === '/dashboard')).toBe(true);
-    expect(items.some((i) => i.route === '/administration')).toBe(true);
+    expect(items.some((i) => i.route === '/admin/access-control')).toBe(true);
+    expect(items.some((i) => i.route === '/configuration')).toBe(true);
+  });
+
+  it('remplace la navigation globale par les vues CRM sur la route commerciale', async () => {
+    await component.router.navigateByUrl('/crm-commercial?view=activities');
+    fixture.detectChanges();
+
+    expect(component.isCrmRoute()).toBe(true);
+    expect(component.activeCrmView()).toBe('activities');
+    expect(fixture.nativeElement.querySelector('#topbar-crm-nav')).not.toBeNull();
+    expect(fixture.nativeElement.querySelector('#topbar-main-nav')).toBeNull();
+
+    component.toggleMenu();
+    fixture.detectChanges();
+    expect(fixture.nativeElement.querySelector('#crm-nav-clients-mobile')).not.toBeNull();
+    expect(fixture.nativeElement.querySelector('#dashboard-mobile')).toBeNull();
   });
 
   it('devrait ouvrir, basculer et fermer le menu déroulant utilisateur', () => {
     expect(component.isUserDropdownOpen()).toBe(false);
-    
+
     component.toggleUserDropdown();
     expect(component.isUserDropdownOpen()).toBe(true);
 
@@ -80,6 +141,7 @@ describe('MainLayout Component', () => {
 
     component.toggleUserDropdown();
     expect(component.isUserDropdownOpen()).toBe(true);
+
     component.closeUserDropdown();
     expect(component.isUserDropdownOpen()).toBe(false);
   });
@@ -102,7 +164,6 @@ describe('MainLayout Component', () => {
     expect(component.isUserDropdownOpen()).toBe(true);
 
     await component.logout();
-
     expect(component.isUserDropdownOpen()).toBe(false);
     expect(logoutCalled).toBe(true);
   });
@@ -121,17 +182,56 @@ describe('MainLayout Component', () => {
     expect(component.isMenuOpen()).toBe(false);
   });
 
-  it('devrait mettre à jour la chaîne de recherche et synchroniser avec CashierService', () => {
-    const fakeEvent = { target: { value: 'Facture' } } as unknown as Event;
-    component.onSearchInput(fakeEvent);
-    expect(component.searchQuery()).toBe('Facture');
-    expect(cashierService.filterState().searchQuery).toBe('Facture');
+  it('ne rend pas de Control Panel global sur la route Dossiers', async () => {
+    await component.router.navigateByUrl('/dossiers');
+    fixture.detectChanges();
+
+    expect(fixture.nativeElement.querySelector('#app-control-panel')).toBeNull();
   });
 
-  it('devrait déclencher la création de nouvelle transaction via onNouveau()', () => {
-    expect(cashierService.isAddingRow()).toBe(false);
-    component.onNouveau();
-    expect(cashierService.isAddingRow()).toBe(true);
+  it('réserve l’écriture dans la caisse native à admin et caissiere', () => {
+    expect(component.canEditCaisse()).toBe(true);
+
+    currentRole.set('caissiere');
+    expect(component.canEditCaisse()).toBe(true);
+
+    currentRole.set('tresorier');
+    expect(component.canEditCaisse()).toBe(false);
+  });
+
+  it('ne rend pas de Control Panel global sur la route Caisse', async () => {
+    await component.router.navigateByUrl('/caisse');
+    fixture.detectChanges();
+
+    expect(fixture.nativeElement.querySelector('#app-control-panel')).toBeNull();
+  });
+
+  it('autorise le trésorier uniquement sur ses journaux personnalisés', () => {
+    const treasurer = { ...mockUser, id: 'treasurer-1', role: 'tresorier' as const };
+    currentUser.set(treasurer);
+    currentRole.set('tresorier');
+
+    const journalService = TestBed.inject(JournalService) as unknown as {
+      _journals: { set: (journals: Journal[]) => void };
+    };
+    const ownJournal: Journal = {
+      id: 'journal-own',
+      name: 'Journal du trésorier',
+      type: 'bank',
+      sequence_prefix: 'BANKT',
+      default_account: 'TEST',
+      currency: 'XAF',
+      is_active: true,
+      created_by: treasurer.id,
+    };
+    journalService._journals.set([ownJournal]);
+
+    vi.spyOn(cashierService, 'loadJournalEntries').mockResolvedValue(undefined);
+    cashierService.setActiveJournal(ownJournal.id, ownJournal.sequence_prefix);
+    expect(component.canEditCaisse()).toBe(true);
+
+    journalService._journals.set([{ ...ownJournal, created_by: 'another-user' }]);
+    expect(component.canEditCaisse()).toBe(false);
   });
 
   it('devrait renvoyer le libellé correct pour chaque rôle', () => {
@@ -139,7 +239,33 @@ describe('MainLayout Component', () => {
     expect(component.roleLabel('manager')).toBe('Manager');
   });
 
-  it('devrait masquer le Control Panel si la route n\'est pas caisse', () => {
-    expect(component.isCashierRoute()).toBe(false);
+  it('affiche le libellé du rôle d’accès dynamique dans le badge utilisateur', () => {
+    currentUser.set({ ...mockUser, role: 'employe', customRole: 'daf', roleLabel: 'DAF' });
+    component.isUserDropdownOpen.set(true);
+    fixture.detectChanges();
+
+    expect(fixture.nativeElement.querySelector('#dropdown-user-role-badge')?.textContent).toContain('DAF');
+    expect(fixture.nativeElement.querySelector('#dropdown-user-role-badge')?.textContent).not.toContain('Employé');
+  });
+
+  it('devrait ouvrir, basculer et fermer le menu déroulant Configuration', () => {
+    expect(component.isConfigDropdownOpen()).toBe(false);
+
+    component.toggleConfigDropdown();
+    expect(component.isConfigDropdownOpen()).toBe(true);
+
+    component.toggleConfigDropdown();
+    expect(component.isConfigDropdownOpen()).toBe(false);
+
+    component.toggleConfigDropdown();
+    expect(component.isConfigDropdownOpen()).toBe(true);
+
+    component.closeConfigDropdown();
+    expect(component.isConfigDropdownOpen()).toBe(false);
+  });
+
+  it('ne rend pas de Control Panel global sur la route initiale', () => {
+    fixture.detectChanges();
+    expect(fixture.nativeElement.querySelector('#app-control-panel')).toBeNull();
   });
 });

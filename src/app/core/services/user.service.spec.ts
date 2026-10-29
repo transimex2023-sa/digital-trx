@@ -2,11 +2,12 @@ import { TestBed } from '@angular/core/testing';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { UserService } from './user.service';
 import { SupabaseService } from './supabase.service';
+import { AuthService } from './auth.service';
 
 describe('UserService', () => {
   let service: UserService;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     TestBed.configureTestingModule({
       providers: [
         UserService,
@@ -18,11 +19,18 @@ describe('UserService', () => {
             ensureInitialized: vi.fn().mockResolvedValue(true),
           },
         },
+        {
+          provide: AuthService,
+          useValue: {
+            token: () => 'mock-jwt-token',
+            currentUser: () => ({ id: 'usr-1', email: 'test@transmex.com' }),
+          },
+        },
       ],
     });
 
     localStorage.clear();
-    const mockUsers = [
+    const serverUsers = [
       {
         id: 'usr-1',
         email: 'karim.meziani@transmex.com',
@@ -46,12 +54,11 @@ describe('UserService', () => {
         createdAt: new Date().toISOString(),
       },
     ];
-    localStorage.setItem('transmex_users_store', JSON.stringify(mockUsers));
-    service = TestBed.inject(UserService);
-
-    // Mock global fetch for backend /api/system/collaborators
-    vi.stubGlobal('fetch', vi.fn().mockImplementation((url: string) => {
-      if (url.includes('/api/system/collaborators')) {
+    vi.stubGlobal('fetch', vi.fn().mockImplementation((url: string, init?: RequestInit) => {
+      if (url.includes('/api/system/collaborators') && (!init?.method || init.method === 'GET')) {
+        return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ users: serverUsers }) });
+      }
+      if (url.includes('/api/system/collaborators') && init?.method === 'POST') {
         return Promise.resolve({
           ok: true,
           status: 201,
@@ -70,8 +77,24 @@ describe('UserService', () => {
           }),
         });
       }
+      if (url.includes('/api/system/collaborators/') && init?.method === 'PATCH') {
+        const userId = url.split('/').pop();
+        const payload = JSON.parse(String(init.body || '{}')) as Partial<typeof serverUsers[number]>;
+        const user = serverUsers.find((candidate) => candidate.id === userId);
+        if (user) Object.assign(user, payload);
+        return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ success: true }) });
+      }
+      if (url.includes('/api/system/collaborators/') && init?.method === 'DELETE') {
+        const userId = url.split('/').pop();
+        const index = serverUsers.findIndex((candidate) => candidate.id === userId);
+        if (index >= 0) serverUsers.splice(index, 1);
+        return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ success: true }) });
+      }
       return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
     }));
+
+    service = TestBed.inject(UserService);
+    await service.loadInitialUsers();
   });
 
   afterEach(() => {
@@ -82,6 +105,33 @@ describe('UserService', () => {
     expect(service).toBeTruthy();
     expect(service.users().length).toBe(2);
     expect(service.totalUsersCount()).toBe(2);
+    expect(localStorage.getItem('transmex_users_store')).toBeNull();
+  });
+
+  it('efface les données de collaborateurs quand le serveur refuse leur lecture', async () => {
+    localStorage.setItem('transmex_users_store', JSON.stringify(service.users()));
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: false,
+      status: 403,
+      json: () => Promise.resolve({ error: 'Permission insuffisante pour cette action.' }),
+    }));
+
+    await service.loadInitialUsers();
+
+    expect(service.users()).toEqual([]);
+    expect(service.error()).toContain('Permission insuffisante');
+    expect(localStorage.getItem('transmex_users_store')).toBeNull();
+  });
+
+  it('distingue une panne réseau lors du chargement des utilisateurs', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('Failed to fetch')));
+
+    await service.loadInitialUsers();
+
+    expect(service.users()).toEqual([]);
+    expect(service.error()).toBe(
+      'Connexion au service de gestion des utilisateurs impossible. Vérifiez votre connexion puis réessayez.'
+    );
   });
 
   it('devrait créer un nouvel utilisateur avec succès et lui assigner un mot de passe temporaire', async () => {
@@ -111,6 +161,50 @@ describe('UserService', () => {
 
     expect(result.success).toBe(false);
     expect(service.error()).toBeTruthy();
+  });
+
+  it('conserve le motif métier de l’API quand la création échoue', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: false,
+      status: 409,
+      json: () => Promise.resolve({ message: 'Cette adresse e-mail est déjà associée à un compte.' }),
+    }));
+
+    const result = await service.createUser({
+      email: 'nouveau@transmex.com',
+      firstName: 'Nouveau',
+      lastName: 'Compte',
+      role: 'employe',
+      tempPassword: 'Password123!',
+    });
+
+    expect(result).toEqual({
+      success: false,
+      error: 'Cette adresse e-mail est déjà associée à un compte.',
+    });
+  });
+
+  it('signale une réponse de création invalide au lieu de créer un utilisateur incomplet', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      status: 201,
+      json: () => Promise.resolve({ user: { id: 'new-id' } }),
+    }));
+    const initialCount = service.users().length;
+
+    const result = await service.createUser({
+      email: 'nouveau@transmex.com',
+      firstName: 'Nouveau',
+      lastName: 'Compte',
+      role: 'employe',
+      tempPassword: 'Password123!',
+    });
+
+    expect(result).toEqual({
+      success: false,
+      error: 'Réponse invalide du serveur de synchronisation.',
+    });
+    expect(service.users()).toHaveLength(initialCount);
   });
 
   it('devrait modifier les informations et le rôle d\'un utilisateur', async () => {

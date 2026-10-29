@@ -2,40 +2,71 @@
 @import '@fontsource/material-icons/index.css';
 @import "tailwindcss";
 
+/* Odoo UI Icons v1.2, Apache-2.0. Credits: Carbon Design System, Google Material Design Icons; generated with IcoMoon. */
+@font-face {
+  font-family: 'odoo_ui_icons';
+  src: url('/assets/odoo-ui-icons/odoo_ui_icons.woff2') format('woff2');
+  font-style: normal;
+  font-weight: normal;
+  font-display: block;
+}
+
+.oi {
+  display: inline-block;
+  width: 1em;
+  font-family: 'odoo_ui_icons' !important;
+  font-style: normal;
+  font-weight: normal;
+  line-height: 1;
+  text-align: center;
+  vertical-align: middle;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+.oi-view-kanban::before {
+  content: '\e814';
+}
+
 /* Configuration officielle Tailwind CSS v4 pour le mode sombre via classe .dark */
 @custom-variant dark (&:where(.dark, .dark *));
 
 :root {
-  /* ========================================================================= */
-  /* PALETTE THÈME CLAIR (Luminosité d'entreprise, contraste net WCAG AA/AAA)   */
-  /* ========================================================================= */
-  --app-bg: #f8fafc;
-  --app-surface: #ffffff;
-  --app-surface-hover: #f1f5f9;
-  --app-surface-active: #e2e8f0;
-  --app-border: #cbd5e1;
-  --app-border-subtle: #e2e8f0;
-  --app-text: #090d16;
-  --app-text-muted: #334155;
-  --app-text-subtle: #475569;
+  color-scheme: light;
 
-  --odoo-primary-purple: #714b67;
-  --odoo-primary-purple-hover: #5d3d54;
-  --odoo-text-teal: #008f8c;
-  --odoo-text-teal-hover: #007976;
+  /* ========================================================================= */
+  /* PALETTE THÈME CLAIR (Confort visuel reposant, tons feutrés et doux)       */
+  /* ========================================================================= */
+  --app-bg: #eef1f5;
+  --app-surface: #ffffff;
+  --app-surface-hover: #e8ecf2;
+  --app-surface-active: #dde3ec;
+  --app-surface-muted: #f1f4f8;
+  --app-border: #d5dce5;
+  --app-border-subtle: #e4e9f0;
+  --app-text: #1e293b;
+  --app-text-muted: #475569;
+  --app-text-subtle: #64748b;
+
+  --odoo-primary-purple: #6d4264;
+  --odoo-primary-purple-hover: #583350;
+  --odoo-text-teal: #008784;
+  --odoo-text-teal-hover: #007370;
   --odoo-status-green: #15803d;
   --odoo-avatar-gold: #b45309;
 
   --odoo-topbar-bg: #ffffff;
-  --odoo-topbar-text: #090d16;
-  --odoo-topbar-border: #e2e8f0;
+  --odoo-topbar-text: #1e293b;
+  --odoo-topbar-border: #d5dce5;
 
-  --odoo-panel-bg: #f8fafc;
-  --odoo-panel-text: #090d16;
-  --odoo-panel-border: #e2e8f0;
+  --odoo-panel-bg: #f4f6f9;
+  --odoo-panel-text: #1e293b;
+  --odoo-panel-border: #d5dce5;
 }
 
 html.dark, :root[data-theme="dark"], .dark {
+  color-scheme: dark;
+
   /* ========================================================================= */
   /* PALETTE THÈME SOMBRE (Odoo Enterprise ERP Sombre - Haute lisibilité)      */
   /* ========================================================================= */
@@ -43,6 +74,7 @@ html.dark, :root[data-theme="dark"], .dark {
   --app-surface: #2b2f33;
   --app-surface-hover: #343a40;
   --app-surface-active: #3e444a;
+  --app-surface-muted: #24282d;
   --app-border: #383f45;
   --app-border-subtle: #2b2f33;
   --app-text: #f8fafc;
@@ -87,11 +119,21 @@ html.dark .bg-white,
 }
 
 html.dark .bg-slate-50,
+html.dark .bg-slate-50\/50,
+html.dark .bg-slate-50\/75,
 html.dark .bg-slate-100,
 html.dark .bg-slate-100\/80,
+html.dark .bg-slate-200,
+html.dark .bg-slate-200\/80,
+html.dark .bg-slate-300,
 :root[data-theme="dark"] .bg-slate-50,
+:root[data-theme="dark"] .bg-slate-50\/50,
+:root[data-theme="dark"] .bg-slate-50\/75,
 :root[data-theme="dark"] .bg-slate-100,
-:root[data-theme="dark"] .bg-slate-100\/80 {
+:root[data-theme="dark"] .bg-slate-100\/80,
+:root[data-theme="dark"] .bg-slate-200,
+:root[data-theme="dark"] .bg-slate-200\/80,
+:root[data-theme="dark"] .bg-slate-300 {
   background-color: var(--app-surface-hover) !important;
   border-color: var(--app-border) !important;
 }
@@ -168,9 +210,156 @@ html.dark .bg-amber-50\/80 {
   border-color: rgba(245, 158, 11, 0.35) !important;
 }
 
-/* Rehaussement des textes gris en mode clair pour passer le test WCAG AA */
+/* Adoucissement et confort visuel en Mode Clair (anti-éblouissement) */
+html:not(.dark) {
+  background-color: var(--app-bg);
+  color: var(--app-text);
+}
+
+html:not(.dark) .layout-container {
+  background-color: var(--app-bg);
+}
+
+html:not(.dark) .bg-slate-50 {
+  background-color: #f1f4f8 !important;
+}
+
+html:not(.dark) .bg-slate-100 {
+  background-color: #e8ecf2 !important;
+}
+
+html:not(.dark) .border-slate-200 {
+  border-color: var(--app-border) !important;
+}
+
+html:not(.dark) .border-slate-300 {
+  border-color: #cbd5e1 !important;
+}
+
+html:not(.dark) .text-slate-900,
+html:not(.dark) .text-slate-950 {
+  color: #1e293b !important; /* Ardoise doux au lieu de noir pur aveuglant */
+}
+
+/* Adoucissement du cyan et des couleurs d'accent en mode clair */
+html:not(.dark) .text-\[\#00A09D\] {
+  color: #008784 !important;
+}
+
+html:not(.dark) .border-\[\#00A09D\] {
+  border-color: #008784 !important;
+}
+
+html:not(.dark) .bg-\[\#00A09D\] {
+  background-color: #008784 !important;
+}
+
+html:not(.dark) .bg-\[\#00A09D\]\/15 {
+  background-color: rgba(0, 135, 132, 0.12) !important;
+}
+
+/* Atténuation reposante des badges de statut en mode clair */
+html:not(.dark) .bg-emerald-50 {
+  background-color: #ecfdf5 !important;
+  color: #065f46 !important;
+  border-color: #a7f3d0 !important;
+}
+
+html:not(.dark) .bg-rose-50 {
+  background-color: #fff1f2 !important;
+  color: #9f1239 !important;
+  border-color: #fecdd3 !important;
+}
+
+html:not(.dark) .bg-amber-50 {
+  background-color: #fffbeb !important;
+  color: #92400e !important;
+  border-color: #fde68a !important;
+}
+
+html:not(.dark) .bg-blue-50 {
+  background-color: #eff6ff !important;
+  color: #1e40af !important;
+  border-color: #bfdbfe !important;
+}
+
+html:not(.dark) .bg-indigo-50 {
+  background-color: #f5f3ff !important;
+  color: #5b21b6 !important;
+  border-color: #ddd6fe !important;
+}
+
+/* Rehaussement des textes gris en mode clair pour passer le test WCAG AA sans éblouir */
 html:not(.dark) .text-slate-400 {
-  color: #64748b; /* Rehaussé de slate-400 (#94a3b8) vers slate-500 (#64748b) pour lisibilité AA */
+  color: #64748b;
+}
+
+/* Tables d'affaires et Tree View style Odoo nets et contrastés en mode clair */
+html:not(.dark) .odoo-table {
+  background-color: #ffffff !important;
+}
+
+html:not(.dark) .odoo-head-row {
+  background-color: #f8fafc !important;
+  border-bottom: 2px solid #cbd5e1 !important;
+}
+
+html:not(.dark) .odoo-head-row th {
+  color: #0f172a !important;
+  font-weight: 700 !important;
+}
+
+html:not(.dark) .odoo-data-row {
+  background-color: #ffffff !important;
+  border-bottom: 1px solid #e2e8f0 !important;
+}
+
+html:not(.dark) .odoo-data-row:hover {
+  background-color: #f1f5f9 !important;
+}
+
+html:not(.dark) .odoo-data-row td {
+  color: #0f172a !important;
+  font-weight: 500;
+}
+
+/* Bandeau de contrôle (Control Panel) et Topbar nets en mode clair */
+html:not(.dark) .control-panel {
+  background-color: #ffffff !important;
+  border-bottom: 1px solid #cbd5e1 !important;
+  box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.05);
+}
+
+html:not(.dark) .topbar {
+  background-color: #ffffff !important;
+  border-bottom: 1px solid #cbd5e1 !important;
+  box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.03);
+}
+
+html:not(.dark) .topbar .nav-link {
+  color: #0f172a !important;
+  font-weight: 600 !important;
+}
+
+html:not(.dark) .topbar .nav-link:hover {
+  color: #008784 !important;
+}
+
+/* Input de recherche Odoo clair */
+html:not(.dark) .search-bar,
+html:not(.dark) .search-bar-odoo {
+  background-color: #ffffff !important;
+  border: 1.5px solid #cbd5e1 !important;
+}
+
+html:not(.dark) .search-bar input,
+html:not(.dark) .search-bar-odoo input {
+  color: #0f172a !important;
+}
+
+html:not(.dark) .search-bar input::placeholder,
+html:not(.dark) .search-bar-odoo input::placeholder {
+  color: #64748b !important;
 }
 
 html.dark .border-slate-200,
@@ -240,10 +429,10 @@ html:not(.dark) #enterprise-control-panel div {
   color: var(--odoo-panel-text);
 }
 
-/* 4. ALIGNEMENT ET RENDU DES ICÔNES MATERIAL ICONS */
+/* 4. ALIGNEMENT ET RENDU DES ICÔNES MATERIAL ICONS ANTI-FOUT */
 .material-icons,
 mat-icon {
-  font-family: 'Material Icons';
+  font-family: 'Material Symbols Outlined', 'Material Icons', sans-serif;
   font-weight: normal;
   font-style: normal;
   font-size: 24px;
@@ -255,15 +444,21 @@ mat-icon {
   word-wrap: normal;
   direction: ltr;
   vertical-align: middle;
+  overflow: hidden;
+  text-rendering: optimizeLegibility;
+  font-feature-settings: 'liga';
   -webkit-font-feature-settings: 'liga';
+  -moz-font-feature-settings: 'liga';
   -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  user-select: none;
 }
 
-/* 5. ANIMATIONS ET STYLES DES NOTIFICATIONS TOAST GLOBALES */
+/* 5. SYSTÈME DE NOTIFICATIONS UNIFIÉ SHADCN UI (SONNER TOAST, ALERT & POPOVER) */
 @keyframes toastSlideIn {
   from {
     opacity: 0;
-    transform: translateY(-12px) scale(0.95);
+    transform: translateY(-8px) scale(0.97);
   }
   to {
     opacity: 1;
@@ -271,7 +466,352 @@ mat-icon {
   }
 }
 
-.toast-item {
-  animation: toastSlideIn 0.28s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+@keyframes toastAutoFadeOut {
+  0% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+  80% {
+    opacity: 0;
+    transform: translateY(-6px) scale(0.97);
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(-10px) scale(0.95);
+    pointer-events: none;
+    visibility: hidden;
+    display: none;
+  }
 }
 
+.toast-item,
+.shadcn-toast {
+  animation: toastSlideIn 0.22s cubic-bezier(0.16, 1, 0.3, 1) forwards, toastAutoFadeOut 0.35s ease-in 9.65s forwards;
+  background-color: #ffffff !important;
+  color: #09090b !important;
+  border: 1px solid #e4e4e7 !important;
+  border-radius: 0.75rem !important;
+  box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.08), 0 4px 6px -4px rgba(0, 0, 0, 0.05) !important;
+}
+
+html.dark .toast-item,
+html.dark .shadcn-toast,
+:root[data-theme="dark"] .toast-item,
+:root[data-theme="dark"] .shadcn-toast {
+  background-color: #09090b !important;
+  color: #fafafa !important;
+  border-color: #27272a !important;
+  box-shadow: 0 14px 28px -6px rgba(0, 0, 0, 0.55), 0 4px 10px -4px rgba(0, 0, 0, 0.4) !important;
+}
+
+.shadcn-toast-error {
+  border-color: #fecaca !important;
+}
+
+html.dark .shadcn-toast-error {
+  border-color: rgba(239, 68, 68, 0.4) !important;
+}
+
+.shadcn-toast-success,
+.shadcn-toast-warning,
+.shadcn-toast-info {
+  border-color: #e4e4e7 !important;
+}
+
+html.dark .shadcn-toast-success,
+html.dark .shadcn-toast-warning,
+html.dark .shadcn-toast-info {
+  border-color: #27272a !important;
+}
+
+/* Harmonisation globale façon Toast flottant Shadcn UI (comme la Caisse) */
+.feedback,
+.crm-feedback,
+.crm-error,
+#success-feedback-banner,
+#error-feedback-banner,
+#hr-success-alert,
+#hr-error-alert,
+#hr-service-error-alert,
+#hr-modal-error-alert,
+#profile-feedback-alert,
+#profile-pwd-success-alert,
+#profile-error-alert,
+#profile-pwd-error-alert,
+#login-error-alert {
+  position: fixed !important;
+  top: 1rem !important;
+  right: 1rem !important;
+  z-index: 99999 !important;
+  width: calc(100vw - 2rem) !important;
+  max-width: 24rem !important;
+  margin: 0 !important;
+  border-radius: 0.75rem !important;
+  border: 1px solid #e4e4e7 !important;
+  padding: 0.875rem 1rem !important;
+  font-size: 0.8125rem !important;
+  line-height: 1.4 !important;
+  font-weight: 500 !important;
+  background-color: #ffffff !important;
+  color: #09090b !important;
+  box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.08), 0 4px 6px -4px rgba(0, 0, 0, 0.05) !important;
+  animation: toastSlideIn 0.2s cubic-bezier(0.16, 1, 0.3, 1) forwards, toastAutoFadeOut 0.35s ease-in 9.65s forwards;
+  pointer-events: auto;
+}
+
+/* Alerte inline contenue (ex: popover de notifications) */
+.shadcn-alert {
+  position: relative;
+  width: 100%;
+  border-radius: 0.625rem !important;
+  border: 1px solid #e4e4e7 !important;
+  padding: 0.75rem 1rem !important;
+  font-size: 0.8125rem !important;
+  line-height: 1.4 !important;
+  font-weight: 500 !important;
+  background-color: #ffffff !important;
+  color: #09090b !important;
+  box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.04) !important;
+}
+
+/* Décalage si succès et erreur coexistent */
+.feedback:not(.feedback-error):not(.error) + .feedback.feedback-error,
+.crm-feedback + .crm-error {
+  top: 5.5rem !important;
+}
+
+/* Toasts de Succès / Neutre (Style Shadcn Sonner épuré et sobre) */
+.shadcn-alert-success,
+.feedback:not(.feedback-error):not(.error),
+.feedback.success,
+.crm-feedback,
+#success-feedback-banner,
+#hr-success-alert,
+#profile-feedback-alert,
+#profile-pwd-success-alert {
+  border-color: #e4e4e7 !important;
+  background-color: #ffffff !important;
+  color: #09090b !important;
+}
+
+/* Toasts Destructive / Erreur (Bordure subtile, texte sobre sans vert/rouge fluo) */
+.shadcn-alert-destructive,
+.feedback.feedback-error,
+.feedback.error,
+.crm-error,
+#error-feedback-banner,
+#hr-error-alert,
+#hr-service-error-alert,
+#hr-modal-error-alert,
+#profile-error-alert,
+#profile-pwd-error-alert,
+#login-error-alert {
+  border-color: #fecaca !important;
+  background-color: #ffffff !important;
+  color: #09090b !important;
+}
+
+html.dark .feedback,
+html.dark .crm-feedback,
+html.dark .crm-error,
+html.dark #success-feedback-banner,
+html.dark #error-feedback-banner,
+html.dark #hr-success-alert,
+html.dark #hr-error-alert,
+html.dark #hr-service-error-alert,
+html.dark #hr-modal-error-alert,
+html.dark #profile-feedback-alert,
+html.dark #profile-pwd-success-alert,
+html.dark #profile-error-alert,
+html.dark #profile-pwd-error-alert,
+html.dark #login-error-alert,
+html.dark .shadcn-alert {
+  background-color: #09090b !important;
+  color: #fafafa !important;
+  border-color: #27272a !important;
+  box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.5), 0 4px 6px -4px rgba(0, 0, 0, 0.4) !important;
+}
+
+html.dark .shadcn-alert-success,
+html.dark .feedback:not(.feedback-error):not(.error),
+html.dark .feedback.success,
+html.dark .crm-feedback,
+html.dark #success-feedback-banner,
+html.dark #hr-success-alert,
+html.dark #profile-feedback-alert,
+html.dark #profile-pwd-success-alert {
+  border-color: #27272a !important;
+  color: #fafafa !important;
+}
+
+html.dark .shadcn-alert-destructive,
+html.dark .feedback.feedback-error,
+html.dark .feedback.error,
+html.dark .crm-error,
+html.dark #error-feedback-banner,
+html.dark #hr-error-alert,
+html.dark #hr-service-error-alert,
+html.dark #hr-modal-error-alert,
+html.dark #profile-error-alert,
+html.dark #profile-pwd-error-alert,
+html.dark #login-error-alert {
+  border-color: rgba(239, 68, 68, 0.4) !important;
+  color: #fafafa !important;
+}
+
+/* Popover Centre de notifications Shadcn UI */
+.shadcn-notification-popover {
+  background-color: #ffffff !important;
+  color: #09090b !important;
+  border: 1px solid #e4e4e7 !important;
+  border-radius: 0.75rem !important;
+  box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 8px 10px -6px rgba(0, 0, 0, 0.08) !important;
+  animation: toastSlideIn 0.16s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+html.dark .shadcn-notification-popover,
+:root[data-theme="dark"] .shadcn-notification-popover {
+  background-color: #09090b !important;
+  color: #fafafa !important;
+  border-color: #27272a !important;
+  box-shadow: 0 20px 30px -6px rgba(0, 0, 0, 0.65) !important;
+}
+
+/* 6. MODALES, MENUS DÉROULANTS ET POPOVERS RÉACTIFS AU THÈME */
+.modal-surface {
+  background-color: var(--app-surface);
+  color: var(--app-text);
+  border-color: var(--app-border);
+}
+
+html:not(.dark) .modal-surface {
+  background-color: #ffffff;
+  color: #0f172a;
+  border-color: #e2e8f0;
+  box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 8px 10px -6px rgba(0, 0, 0, 0.1);
+}
+
+html.dark .modal-surface {
+  background-color: #2b2f33;
+  color: #f8fafc;
+  border-color: rgba(255, 255, 255, 0.12);
+  box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5), 0 8px 10px -6px rgba(0, 0, 0, 0.5);
+}
+
+/* Scrollbars discrètes adaptées au thème */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+html:not(.dark) ::-webkit-scrollbar-track {
+  background: #f1f5f9;
+}
+
+html:not(.dark) ::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 9999px;
+}
+
+html:not(.dark) ::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
+
+html.dark ::-webkit-scrollbar-track {
+  background: #1e2227;
+}
+
+html.dark ::-webkit-scrollbar-thumb {
+  background: #383f45;
+  border-radius: 9999px;
+}
+
+html.dark ::-webkit-scrollbar-thumb:hover {
+  background: #4b5563;
+}
+
+/* Keep Cotations' Kanban board styles outside the component stylesheet budget. */
+.quotes-page .quotes-kanban {
+  display: grid;
+  grid-auto-columns: minmax(240px, 280px);
+  grid-auto-flow: column;
+  align-items: start;
+  gap: 12px;
+  overflow-x: auto;
+  padding: 14px 12px;
+}
+
+.quotes-page .quotes-kanban-column {
+  min-height: 220px;
+  padding: 10px;
+  border: 1px solid var(--quote-border);
+  border-radius: 5px;
+  background: var(--quote-surface-muted);
+}
+
+.quotes-page .quotes-kanban-column > header,
+.quotes-page .quote-kanban-card-heading,
+.quotes-page .quote-kanban-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.quotes-page .quotes-kanban-column > header {
+  padding: 3px 2px 10px;
+  border-bottom: 1px solid var(--quote-border);
+}
+
+.quotes-page .quotes-kanban-column h2,
+.quotes-page .quote-kanban-card h3 {
+  margin: 0;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.quotes-page .quotes-kanban-column > header > span {
+  color: var(--quote-muted);
+  font-size: 11px;
+}
+
+.quotes-page .quote-kanban-card {
+  margin-top: 9px;
+  padding: 11px;
+  border: 1px solid var(--quote-border);
+  border-radius: 5px;
+  background: var(--quote-surface);
+  box-shadow: 0 1px 3px rgba(18, 60, 109, .06);
+}
+
+.quotes-page .quote-kanban-card h3 { color: var(--quote-accent); }
+.quotes-page .quote-kanban-card p { margin: 6px 0 0; color: var(--quote-muted); font-size: 11px; overflow-wrap: anywhere; }
+.quotes-page .quote-kanban-card .quote-kanban-title { color: var(--quote-text); font-size: 12px; font-weight: 650; }
+.quotes-page .quote-kanban-details { display: flex; flex-direction: column; gap: 4px; margin-top: 10px; }
+.quotes-page .quote-kanban-details strong { color: var(--quote-text); font-size: 13px; font-variant-numeric: tabular-nums; }
+.quotes-page .quote-kanban-details span,
+.quotes-page .quote-kanban-footer > span { color: var(--quote-subtle); font-size: 10px; }
+.quotes-page .quote-kanban-footer { margin-top: 7px; padding-top: 7px; border-top: 1px solid var(--quote-border); }
+.quotes-page .quotes-kanban-empty { margin: 12px 2px; color: var(--quote-subtle); font-size: 11px; text-align: center; }
+
+/* 7. ANGULAR CDK DRAG AND DROP - STYLES GLOBAUX POUR ÉLÉMENTS ATTACHÉS AU BODY */
+.cdk-drag-preview {
+  box-sizing: border-box;
+  border-radius: 12px;
+  box-shadow: 0 14px 28px -4px rgba(11, 94, 215, 0.22), 0 8px 12px rgba(0, 0, 0, 0.08);
+  opacity: 0.95;
+  cursor: grabbing !important;
+  z-index: 10000 !important;
+}
+
+.cdk-drag-placeholder {
+  opacity: 0.45;
+}
+
+.cdk-drag-animating {
+  transition: transform 250ms cubic-bezier(0, 0, 0.2, 1);
+}
+
+.cdk-drop-list-dragging .cdk-drag:not(.cdk-drag-placeholder) {
+  transition: transform 250ms cubic-bezier(0, 0, 0.2, 1);
+}

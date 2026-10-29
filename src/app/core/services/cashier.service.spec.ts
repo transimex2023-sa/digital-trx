@@ -4,15 +4,26 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { CashierService } from './cashier.service';
 import { SupabaseService } from './supabase.service';
 import { AuthService } from './auth.service';
+import { AccessControlService } from './access-control.service';
 import { ExportService } from './export.service';
 import { NotificationService } from './notification.service';
 
 describe('CashierService - Architecture Hybride & Signals', () => {
   let service: CashierService;
   let originalFetch: typeof globalThis.fetch;
+  let cashierReadAllowed: boolean;
+  let fetchMock: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
     originalFetch = globalThis.fetch;
+    cashierReadAllowed = false;
+    fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ operations: [] }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    );
+    globalThis.fetch = fetchMock as typeof globalThis.fetch;
 
     TestBed.configureTestingModule({
       providers: [
@@ -50,6 +61,14 @@ describe('CashierService - Architecture Hybride & Signals', () => {
             currentUser: () => ({ id: 'usr-1', email: 'test@transmex.cm' }),
           },
         },
+        {
+          provide: AccessControlService,
+          useValue: {
+            hasPermission: (permissionKey: string) =>
+              permissionKey === 'cashier.read' && cashierReadAllowed,
+            effectivePermissions: () => [],
+          },
+        },
       ],
     });
     service = TestBed.inject(CashierService);
@@ -64,6 +83,16 @@ describe('CashierService - Architecture Hybride & Signals', () => {
     expect(service.allTransactions().length).toBe(0);
     expect(service.currentBalance()).toBe(0);
     expect(service.paginationLabel()).toBe('0 / 0');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('ne devrait pas appeler les endpoints Caisse sans la permission cashier.read', async () => {
+    await service.loadTransactions();
+    await service.loadCashierSummary();
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(service.allTransactions()).toEqual([]);
+    expect(service.serverSummary()).toBeNull();
   });
 
   it('devrait sauvegarder via l’API serveur-relais et mettre à jour le Signal instantanément (cas nominal)', async () => {
@@ -75,7 +104,9 @@ describe('CashierService - Architecture Hybride & Signals', () => {
       type_transaction: 'Carburant',
       type_description: 'Station Total',
       category: 'sortie' as const,
+      status: 'posted' as const,
       matricule_vehicule: 'LT-5544-AA',
+      dossier_id: 'dossier-1',
       first_name: 'Samuel',
       employee: 'Samuel Eboa',
       quantity: 50,
@@ -87,8 +118,10 @@ describe('CashierService - Architecture Hybride & Signals', () => {
     let fetchCalledWithInit: RequestInit | undefined;
 
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-      fetchCalledWithUrl = String(input);
-      fetchCalledWithInit = init;
+      if (String(input) === '/api/cahier/operations') {
+        fetchCalledWithUrl = String(input);
+        fetchCalledWithInit = init;
+      }
       return new Response(
         JSON.stringify({
           success: true,
@@ -103,7 +136,9 @@ describe('CashierService - Architecture Hybride & Signals', () => {
       typeTransaction: 'Carburant',
       typeDescription: 'Station Total',
       category: 'sortie',
+      status: 'posted',
       matriculeVehicule: 'LT-5544-AA',
+      dossierId: 'dossier-1',
       firstName: 'Samuel',
       employee: 'Samuel Eboa',
       quantity: 50,
@@ -119,14 +154,45 @@ describe('CashierService - Architecture Hybride & Signals', () => {
     // Vérifie que pieceComptable n'est pas imposé côté client (null envoyé pour laisser le trigger l'assigner comme Odoo)
     const bodySent = JSON.parse(String(fetchCalledWithInit?.body || '{}'));
     expect(bodySent.pieceComptable).toBeNull();
+    expect(bodySent.dossierId).toBe('dossier-1');
 
     // 2. Vérification de la mise à jour immédiate du Signal avec la pièce retournée par le serveur
     expect(result.success).toBe(true);
     expect(service.allTransactions().length).toBe(1);
     expect(service.allTransactions()[0].id).toBe('tx-uuid-123');
     expect(service.allTransactions()[0].pieceComptable).toBe('CSH1/2026/00001');
+    expect(service.allTransactions()[0].dossierId).toBe('dossier-1');
     expect(service.allTransactions()[0].libelle).toBe('Plein carburant camion');
     expect(service.currentBalance()).toBe(-75000);
+  });
+
+  it('devrait transmettre le dossier lié lors de la modification d’une opération Caisse', async () => {
+    const mapped = service.mapDatabaseOperations([{
+      id: 'tx-existing',
+      date: '2026-10-01',
+      libelle: 'Dépense existante',
+      category: 'sortie',
+      status: 'posted',
+      montant: -10000,
+    }]);
+    (service as unknown as { _transactions: { set: (value: unknown) => void } })._transactions.set(mapped);
+
+    let updateBody: Record<string, unknown> = {};
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === 'PUT') {
+        updateBody = JSON.parse(String(init.body || '{}')) as Record<string, unknown>;
+      }
+      return new Response(JSON.stringify({ summary: { solde_global: -10000 } }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }) as typeof globalThis.fetch;
+
+    const result = await service.updateTransaction('tx-existing', { dossierId: 'dossier-2' });
+
+    expect(result.success).toBe(true);
+    expect(updateBody['dossierId']).toBe('dossier-2');
+    expect(service.allTransactions()[0].dossierId).toBe('dossier-2');
   });
 
   it('devrait refuser l’écriture si l’API serveur-relais renvoie une erreur', async () => {
@@ -150,7 +216,8 @@ describe('CashierService - Architecture Hybride & Signals', () => {
     expect(service.currentBalance()).toBe(0);
   });
 
-  it('devrait récupérer les opérations via l’API rapide dans loadTransactions()', async () => {
+  it('devrait ne compter que les opérations posted dans le solde après chargement', async () => {
+    cashierReadAllowed = true;
     const mockRows = [
       {
         id: 'row-1',
@@ -163,6 +230,36 @@ describe('CashierService - Architecture Hybride & Signals', () => {
         employee: 'Directeur',
         quantity: 1,
         montant: 500000,
+        status: 'posted' as const,
+      },
+      {
+        id: 'row-1b',
+        date: new Date('2026-09-06T09:00:00Z').toISOString(),
+        libelle: 'Carburant mission',
+        type_transaction: 'Carburant',
+        type_description: '',
+        category: 'sortie' as const,
+        first_name: 'Chauffeur',
+        employee: 'Jean',
+        quantity: 1,
+        montant: -150000,
+        status: 'posted' as const,
+      },
+      {
+        id: 'row-2',
+        date: '2026-09-07',
+        libelle: 'Brouillon non comptabilisé',
+        category: 'entree' as const,
+        montant: 250000,
+        status: 'draft' as const,
+      },
+      {
+        id: 'row-3',
+        date: '2026-09-08',
+        libelle: 'Opération annulée',
+        category: 'sortie' as const,
+        montant: -100000,
+        status: 'cancelled' as const,
       },
     ];
 
@@ -175,17 +272,58 @@ describe('CashierService - Architecture Hybride & Signals', () => {
 
     await service.loadTransactions();
 
-    expect(service.allTransactions().length).toBe(1);
-    expect(service.allTransactions()[0].libelle).toBe('Versement Caisse');
-    expect(service.currentBalance()).toBe(500000);
+    expect(service.allTransactions().length).toBe(4);
+    expect(service.allTransactions().find((tx) => tx.id === 'row-1')?.libelle).toBe('Versement Caisse');
+    expect(service.currentBalance()).toBe(350000);
+    expect(service.caisseTotalEntrees()).toBe(500000);
+    expect(service.caisseTotalSorties()).toBe(150000);
   });
 
-  it('devrait supprimer les éléments sélectionnés et recalculer les soldes', async () => {
-    globalThis.fetch = (async () => {
+  it('devrait donner la priorité absolue à serverSummary pour caisseBalance, caisseTotalEntrees et caisseTotalSorties', async () => {
+    cashierReadAllowed = true;
+    globalThis.fetch = (async (input) => {
+      const url = String(input);
+      if (url.includes('/summary')) {
+        return new Response(
+          JSON.stringify({
+            summary: {
+              solde_global: 4200000,
+              total_entrees: 5000000,
+              total_sorties: 800000,
+              total_count: 42,
+            },
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      return new Response(JSON.stringify({ operations: [] }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }) as typeof globalThis.fetch;
+
+    await service.loadCashierSummary();
+
+    expect(service.caisseBalance()).toBe(4200000);
+    expect(service.currentBalance()).toBe(4200000);
+    expect(service.caisseTotalEntrees()).toBe(5000000);
+    expect(service.caisseTotalSorties()).toBe(800000);
+  });
+
+  it('devrait annuler les éléments sélectionnés sans supprimer leur pièce comptable', async () => {
+    globalThis.fetch = (async (input) => {
+      if (String(input).endsWith('/status')) {
+        return new Response(JSON.stringify({
+          success: true,
+          count: 1,
+          data: [{ id: 'tx-delete-1', piece_comptable: 'CSH1/2026/00001', status: 'cancelled' }],
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
       return new Response(JSON.stringify({
         success: true,
         operation: {
           id: 'tx-delete-1',
+          piece_comptable: 'CSH1/2026/00001',
           date: '2026-09-20',
           libelle: 'Transaction à supprimer',
           category: 'sortie',
@@ -211,9 +349,96 @@ describe('CashierService - Architecture Hybride & Signals', () => {
 
     expect(service.allTransactions()[0].selected).toBe(true);
 
-    await service.deleteSelected();
-    expect(service.allTransactions().length).toBe(0);
+    await service.cancelSelected();
+    expect(service.allTransactions().length).toBe(1);
+    expect(service.allTransactions()[0].status).toBe('cancelled');
+    expect(service.allTransactions()[0].pieceComptable).toBe('CSH1/2026/00001');
     expect(service.currentBalance()).toBe(0);
+  });
+
+  it('devrait afficher le motif serveur quand une opération annulée ne peut pas revenir en brouillon', async () => {
+    const mapped = service.mapDatabaseOperations([{
+      id: 'tx-cancelled',
+      date: '2026-10-01',
+      libelle: 'Opération annulée',
+      category: 'sortie',
+      status: 'cancelled',
+      montant: -10000,
+      selected: true,
+    }]);
+    (service as unknown as { _transactions: { set: (value: unknown) => void } })._transactions.set(mapped);
+    globalThis.fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      error: 'Une opération annulée ne peut pas être réactivée ou modifiée.',
+    }), {
+      status: 409,
+      headers: { 'Content-Type': 'application/json' },
+    })) as typeof globalThis.fetch;
+
+    const success = await service.resetSelectedToDraft();
+
+    expect(success).toBe(false);
+    expect(service.error()).toBe('Une opération annulée ne peut pas être réactivée ou modifiée.');
+    expect(service.allTransactions()[0].status).toBe('cancelled');
+  });
+
+  it('devrait indiquer une erreur de connexion distincte si le retour en brouillon ne joint pas le serveur', async () => {
+    const mapped = service.mapDatabaseOperations([{
+      id: 'tx-posted-network',
+      date: '2026-10-01',
+      libelle: 'Opération comptabilisée',
+      category: 'sortie',
+      status: 'posted',
+      montant: -10000,
+      selected: true,
+    }]);
+    (service as unknown as { _transactions: { set: (value: unknown) => void } })._transactions.set(mapped);
+    globalThis.fetch = vi.fn().mockRejectedValue(new TypeError('Failed to fetch')) as typeof globalThis.fetch;
+
+    const success = await service.resetSelectedToDraft();
+
+    expect(success).toBe(false);
+    expect(service.error()).toBe(
+      'Impossible de joindre le service de caisse. Vérifiez votre connexion puis réessayez.'
+    );
+    expect(service.allTransactions()[0].status).toBe('posted');
+  });
+
+  it('devrait remettre en brouillon une opération sélectionnée après confirmation du serveur', async () => {
+    const mapped = service.mapDatabaseOperations([{
+      id: 'tx-posted',
+      date: '2026-10-01',
+      libelle: 'Opération comptabilisée',
+      category: 'sortie',
+      status: 'posted',
+      montant: -10000,
+      selected: true,
+    }]);
+    (service as unknown as { _transactions: { set: (value: unknown) => void } })._transactions.set(mapped);
+    globalThis.fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      success: true,
+      count: 1,
+      data: [{ id: 'tx-posted', status: 'draft' }],
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })) as typeof globalThis.fetch;
+
+    const success = await service.resetSelectedToDraft();
+
+    expect(success).toBe(true);
+    expect(service.allTransactions()[0].status).toBe('draft');
+    expect(service.allTransactions()[0].selected).toBe(false);
+    expect(service.error()).toBeNull();
+  });
+
+  it('ne devrait pas appeler le serveur quand aucune opération n’est sélectionnée pour retour en brouillon', async () => {
+    const request = vi.fn();
+    globalThis.fetch = request as typeof globalThis.fetch;
+
+    const success = await service.resetSelectedToDraft();
+
+    expect(success).toBe(true);
+    expect(request).not.toHaveBeenCalled();
   });
 
   it('devrait filtrer les données réactivement avec les Signals de recherche', async () => {
@@ -251,34 +476,8 @@ describe('CashierService - Architecture Hybride & Signals', () => {
     expect(service.filteredTransactions().length).toBe(1);
   });
 
-  it('devrait calculer la prochaine pièce comptable séquentielle nextPieceComptable (Cas nominal)', async () => {
-    const currentYear = new Date().getFullYear() || 2026;
-    expect(service.nextPieceComptable()).toBe(`CSH1/${currentYear}/00001`);
-
-    globalThis.fetch = (async () => {
-      return new Response(
-        JSON.stringify({
-          operations: [
-            {
-              id: 'row-1',
-              piece_comptable: `CSH1/${currentYear}/00005`,
-              date: new Date().toISOString(),
-              libelle: 'Opération avec pièce',
-              montant: 10000,
-              category: 'entree',
-            },
-          ],
-        }),
-        { status: 200, headers: { 'Content-Type': 'application/json' } }
-      );
-    }) as typeof globalThis.fetch;
-
-    await service.loadTransactions();
-
-    expect(service.nextPieceComptable()).toBe(`CSH1/${currentYear}/00006`);
-  });
-
   it('devrait bloquer immédiatement la création si le numéro de pièce comptable existe déjà (Cas d’erreur)', async () => {
+    cashierReadAllowed = true;
     const currentYear = new Date().getFullYear() || 2026;
     const existingPiece = `CSH1/${currentYear}/00010`;
 
@@ -325,7 +524,6 @@ describe('CashierService - Architecture Hybride & Signals', () => {
     }) as typeof globalThis.fetch;
 
     const result = await service.saveOperationViaApi({
-      pieceComptable: 'CSH1/2026/00099',
       libelle: 'Tentative avec pièce en conflit',
       montant: 12000,
       category: 'sortie',
@@ -334,6 +532,25 @@ describe('CashierService - Architecture Hybride & Signals', () => {
     expect(result.success).toBe(false);
     expect(result.error).toContain('Erreur d\'unicité');
     expect(service.error()).toContain('CSH1/2026/00099');
+  });
+
+  it('devrait refuser une pièce fournie par le client avant tout appel serveur', async () => {
+    let requestSent = false;
+    globalThis.fetch = (async () => {
+      requestSent = true;
+      return new Response(null, { status: 201 });
+    }) as typeof globalThis.fetch;
+
+    const result = await service.saveOperationViaApi({
+      pieceComptable: 'CSH1/2026/00099',
+      libelle: 'Pièce importée manuellement',
+      montant: 12000,
+      category: 'sortie',
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('attribuée par la base');
+    expect(requestSent).toBe(false);
   });
 
   it('devrait initialiser la pagination à 80 éléments minimum et respecter ce plancher via setPageSize', () => {
@@ -380,5 +597,55 @@ describe('CashierService - Architecture Hybride & Signals', () => {
     expect(service.paginationLabel()).toBe('81-95 / 95');
     expect(service.hasNextPage()).toBe(false);
     expect(service.hasPrevPage()).toBe(true);
+  });
+
+  it('devrait rendre visible en première page un nouveau brouillon sans pièce', async () => {
+    const postedRows = Array.from({ length: 80 }, (_, index) => ({
+      id: `posted-${index}`,
+      piece_comptable: `CSH1/2026/${String(index + 1).padStart(5, '0')}`,
+      date: '2026-10-02',
+      libelle: `Opération comptabilisée ${index}`,
+      category: 'entree' as const,
+      status: 'posted' as const,
+      montant: 100,
+    }));
+    const mappedRows = service.mapDatabaseOperations(postedRows);
+    (service as unknown as { _transactions: { set: (value: unknown) => void } })._transactions.set(mappedRows);
+    service.setPageIndex(1);
+
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === 'POST') {
+        return new Response(JSON.stringify({
+          success: true,
+          operation: {
+            id: 'draft-without-piece',
+            piece_comptable: null,
+            date: '2026-10-03',
+            libelle: 'Brouillon sans pièce',
+            service: 'TRANSIT',
+            category: 'entree',
+            status: 'draft',
+            montant: 1,
+            created_at: '2026-10-03T10:00:00.000Z',
+          },
+        }), { status: 201, headers: { 'Content-Type': 'application/json' } });
+      }
+      return new Response(JSON.stringify({ operations: [] }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }) as typeof globalThis.fetch;
+
+    const result = await service.saveOperationViaApi({
+      libelle: 'Brouillon sans pièce',
+      service: 'TRANSIT',
+      category: 'entree',
+      status: 'draft',
+      montant: 1,
+    });
+
+    expect(result.success).toBe(true);
+    expect(service.filterState().pageIndex).toBe(0);
+    expect(service.pagedTransactions()[0].id).toBe('draft-without-piece');
   });
 });

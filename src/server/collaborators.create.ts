@@ -1,8 +1,16 @@
 import express from 'express';
 import { UserRole } from '../app/core/models/auth.model';
-import { normalizeUserRole } from '../app/core/utils/role.utils';
 import { getSupabaseAdmin } from './auth';
+import { syncUserAccessRole } from './access-role-sync';
 
+/**
+ * Création d'un collaborateur (POST /api/collaborators & /api/users)
+ * 
+ * Correction P0 #2 :
+ * - Élimination définitive du statut HTTP 207 partiel.
+ * - Transaction logique et rollback compensatoire : en cas d'échec sur `profiles` ou sur les rôles `access_user_roles`,
+ *   le compte `auth.users` est immédiatement révoqué pour éviter la prolifération de comptes fantômes ou sans permissions.
+ */
 export const createCollaboratorHandler = async (req: express.Request, res: express.Response): Promise<void> => {
   const {
     email,
@@ -33,9 +41,9 @@ export const createCollaboratorHandler = async (req: express.Request, res: expre
     return;
   }
 
-  const validRoles: UserRole[] = ['admin', 'manager', 'tresorier', 'caissiere', 'comptable', 'employe'];
-  if (!role || !validRoles.includes(role)) {
-    res.status(400).json({ error: 'Le rôle Transmex est obligatoire et doit être défini explicitement (admin, manager, tresorier, caissiere, comptable, employe)' });
+  const rawRole = typeof role === 'string' ? role.trim().toLowerCase() : '';
+  if (!rawRole) {
+    res.status(400).json({ error: 'Le rôle Transmex est obligatoire et doit être défini explicitement.' });
     return;
   }
 
@@ -45,11 +53,33 @@ export const createCollaboratorHandler = async (req: express.Request, res: expre
     return;
   }
 
+  const canonicalRoles: UserRole[] = ['admin', 'manager', 'tresorier', 'caissiere', 'comptable', 'employe'];
+  const isCanonical = canonicalRoles.includes(rawRole as UserRole);
+
+  if (!isCanonical) {
+    const { data: dynamicRole, error: roleCheckError } = await adminClient
+      .from('access_roles')
+      .select('id, role_key, is_active')
+      .eq('role_key', rawRole)
+      .eq('is_active', true)
+      .maybeSingle();
+
+    if (roleCheckError || !dynamicRole) {
+      res.status(400).json({
+        error: `Le rôle d'accès « ${role} » est introuvable ou inactif dans le système de gestion des accès.`,
+      });
+      return;
+    }
+  }
+
+  let authUserId: string | null = null;
+
   try {
     const computedDisplayName = displayName || `${firstName || ''} ${lastName || ''}`.trim() || email;
-    const computedRole = normalizeUserRole(role);
+    const computedRole = rawRole;
     const sitesList = Array.isArray(sites) ? sites : (department ? [department] : []);
 
+    // Étape 1 : Création du compte dans auth.users avec métadonnées scellées
     const { data: adminAuthData, error: adminAuthError } = await adminClient.auth.admin.createUser({
       email,
       password,
@@ -76,8 +106,10 @@ export const createCollaboratorHandler = async (req: express.Request, res: expre
       res.status(400).json({ error: 'Échec de la création du compte d’authentification du collaborateur.' });
       return;
     }
-    const authUserId = adminAuthData.user.id;
 
+    authUserId = adminAuthData.user.id;
+
+    // Étape 2 : Création du profil public
     const profilePayload = {
       id: authUserId,
       email,
@@ -96,21 +128,25 @@ export const createCollaboratorHandler = async (req: express.Request, res: expre
 
     if (profileError) {
       console.error('Échec synchronisation profiles:', profileError.message);
-      res.status(207).json({
-        user: {
-          id: authUserId,
-          email,
-          firstName: firstName || '',
-          lastName: lastName || '',
-          displayName: computedDisplayName,
-          role: computedRole,
-          department: department || 'Direction Générale',
-          phone: phone || '',
-          isActive: isActive !== undefined ? isActive : true,
-          createdAt: new Date().toISOString(),
-        },
-        warning: 'Compte créé mais la synchronisation du profil public a rencontré une erreur interne.',
+      // Rollback immédiat du compte Auth pour éviter un utilisateur orphelin
+      await adminClient.auth.admin.deleteUser(authUserId).catch((delErr) => {
+        console.error('Échec rollback auth user après erreur profile:', delErr);
       });
+      res.status(500).json({ error: 'Échec de création du profil. L’opération a été annulée pour garantir la cohérence du système.' });
+      return;
+    }
+
+    // Étape 3 : Affectation atomique du rôle dans access_user_roles
+    try {
+      await syncUserAccessRole(adminClient, authUserId, computedRole, authUserId, 'legacy_profile');
+    } catch (roleError: unknown) {
+      console.error('Échec affectation access_user_roles:', roleError);
+      // Rollback du profil et de l'utilisateur auth
+      await adminClient.from('profiles').delete().eq('id', authUserId);
+      await adminClient.auth.admin.deleteUser(authUserId).catch((delErr) => {
+        console.warn('Rollback deleteUser silencieux:', delErr);
+      });
+      res.status(500).json({ error: 'Échec de synchronisation des permissions d’accès. Création annulée.' });
       return;
     }
 
@@ -131,6 +167,12 @@ export const createCollaboratorHandler = async (req: express.Request, res: expre
     });
   } catch (err: unknown) {
     console.error('Erreur createCollaboratorHandler:', err);
+    if (authUserId) {
+      await adminClient.from('profiles').delete().eq('id', authUserId);
+      await adminClient.auth.admin.deleteUser(authUserId).catch((delErr) => {
+        console.warn('Rollback deleteUser silencieux:', delErr);
+      });
+    }
     res.status(500).json({ error: 'Erreur interne lors de la création du collaborateur.' });
   }
 };

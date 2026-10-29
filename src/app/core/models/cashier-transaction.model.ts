@@ -24,6 +24,7 @@ export interface CashierTransaction {
   noDossier?: string; // Requis si service === 'Opérations' (ex: Matricule véhicule / Dossier)
   /** Alias historique du numéro de dossier/matricule. */
   matriculeVehicule?: string;
+  dossierId?: string | null;
   firstName?: string; // Optionnel pour rétrocompatibilité
   partenaire?: string; // Nom du partenaire ou de l'employé associé
   employee?: string; // Alias employé
@@ -33,6 +34,8 @@ export interface CashierTransaction {
   selected?: boolean; // Case à cocher de sélection
   createdBy?: string; // UUID du créateur (auth.uid() / profiles.id)
   employeeId?: string; // Référence forte vers profiles.id
+  journalId?: string | null; // Identifiant du journal comptable de rattachement
+  journal_id?: string | null; // Alias direct vers la colonne Supabase
   createdAt?: string; // Date de création ISO
   updatedAt?: string; // Date de modification ISO
 }

@@ -1,0 +1,465 @@
+<main class="prospects-page" [class.embedded-prospects]="embedded()" aria-labelledby="prospects-title">
+  @if (!embedded()) {
+    <app-module-control-panel>
+      <div controlPanelStart class="prospects-title-group">
+        @if (canCreate()) {
+          <button
+            type="button"
+            class="primary-action h-9 w-28 shrink-0 justify-center"
+            aria-label="Nouveau prospect"
+            title="Nouveau prospect"
+            (click)="openCreate()">
+            <mat-icon>add</mat-icon><span>Nouveau</span>
+          </button>
+        }
+        <div>
+          <p class="prospects-eyebrow">Développement commercial</p>
+          <h1 id="prospects-title">Contacts</h1>
+        </div>
+      </div>
+
+      <div controlPanelCenter class="w-full">
+        <form
+          class="prospects-control-search flex w-full min-w-0 items-center gap-2 rounded border border-slate-300 bg-white px-2.5 py-1 text-xs focus-within:border-[#0b5ed7] dark:border-white/10 dark:bg-[#0d1f3a] dark:focus-within:border-[#7cb3ff]"
+          (submit)="$event.preventDefault(); applyFilters()">
+          <mat-icon aria-hidden="true" class="!h-4 !w-4 !text-[15px] shrink-0 text-slate-400">search</mat-icon>
+          <input
+            type="search"
+            id="prospects-search-input"
+            name="search"
+            aria-label="Rechercher dans les contacts"
+            placeholder="Nom, société ou contact"
+            [value]="searchDraft()"
+            (input)="searchDraft.set($any($event.target).value)"
+            class="min-w-[60px] flex-1 bg-transparent text-xs text-slate-900 outline-none placeholder:text-slate-400 dark:text-white" />
+          <button
+            type="submit"
+            class="shrink-0 rounded p-1 text-slate-400 transition hover:bg-slate-100 hover:text-[#0b5ed7] dark:hover:bg-white/10 dark:hover:text-[#8cc2ff]"
+            aria-label="Lancer la recherche"
+            title="Rechercher">
+            <mat-icon class="!flex !h-4 !w-4 !items-center !justify-center !text-base">arrow_forward</mat-icon>
+          </button>
+        </form>
+      </div>
+
+      <div controlPanelEnd class="prospects-control-end">
+        <div class="view-switch" role="group" aria-label="Vue des prospects">
+          <button type="button" [class.active]="view() === 'list'" [attr.aria-pressed]="view() === 'list'" aria-label="Vue liste" title="Vue liste" (click)="view.set('list')">
+            <mat-icon>reorder</mat-icon>
+          </button>
+          <button type="button" [class.active]="view() === 'kanban'" [attr.aria-pressed]="view() === 'kanban'" aria-label="Vue Kanban" title="Vue Kanban" (click)="view.set('kanban')">
+            <mat-icon>view_kanban</mat-icon>
+          </button>
+        </div>
+
+        <div class="pagination" aria-label="Pagination des prospects">
+          <span>{{ prospectService.total() }} résultat(s) · {{ currentPage() }} / {{ totalPages() }}</span>
+          <button type="button" class="icon-action" aria-label="Page précédente" [disabled]="currentPage() <= 1" (click)="goToPage(-1)">
+            <mat-icon>chevron_left</mat-icon>
+          </button>
+          <button type="button" class="icon-action" aria-label="Page suivante" [disabled]="currentPage() >= totalPages()" (click)="goToPage(1)">
+            <mat-icon>chevron_right</mat-icon>
+          </button>
+        </div>
+      </div>
+    </app-module-control-panel>
+  }
+
+  @if (feedback()) {
+    <p class="feedback" role="status">{{ feedback() }}</p>
+  }
+  @if (prospectService.error()) {
+    <p class="feedback feedback-error" role="alert">{{ prospectService.error() }}</p>
+  }
+
+  @if (prospectService.isLoading()) {
+    <div class="loading-state" role="status">
+      <mat-icon>progress_activity</mat-icon>
+      <span>Chargement des prospects…</span>
+    </div>
+  } @else if (view() === 'list') {
+    <div class="table-scroll">
+      <table class="prospects-table odoo-table">
+        <thead>
+          <tr class="odoo-head-row select-none">
+            <th scope="col" class="th-checkbox">
+              <input
+                type="checkbox"
+                class="odoo-checkbox"
+                [checked]="isAllSelected()"
+                (change)="toggleSelectAll()"
+                aria-label="Sélectionner tous les prospects"
+              />
+            </th>
+            <th
+              scope="col"
+              class="th-client th-sortable"
+              [attr.aria-sort]="getAriaSort('client')"
+              (click)="toggleSort('client')"
+              (keydown.enter)="toggleSort('client')"
+              (keydown.space)="toggleSort('client'); $event.preventDefault()"
+              tabindex="0"
+              role="columnheader"
+              title="Trier par client">
+              <div class="th-header-label">
+                <span>Client</span>
+                <mat-icon class="sort-icon" [class.sort-active]="sortField() === 'client'">{{ getSortIcon('client') }}</mat-icon>
+              </div>
+            </th>
+            <th
+              scope="col"
+              class="th-country th-sortable"
+              [attr.aria-sort]="getAriaSort('country')"
+              (click)="toggleSort('country')"
+              (keydown.enter)="toggleSort('country')"
+              (keydown.space)="toggleSort('country'); $event.preventDefault()"
+              tabindex="0"
+              role="columnheader"
+              title="Trier par pays">
+              <div class="th-header-label">
+                <span>Pays</span>
+                <mat-icon class="sort-icon" [class.sort-active]="sortField() === 'country'">{{ getSortIcon('country') }}</mat-icon>
+              </div>
+            </th>
+            <th
+              scope="col"
+              class="th-sector th-sortable"
+              [attr.aria-sort]="getAriaSort('sector')"
+              (click)="toggleSort('sector')"
+              (keydown.enter)="toggleSort('sector')"
+              (keydown.space)="toggleSort('sector'); $event.preventDefault()"
+              tabindex="0"
+              role="columnheader"
+              title="Trier par secteur d'activité">
+              <div class="th-header-label">
+                <span>Secteur d'activité</span>
+                <mat-icon class="sort-icon" [class.sort-active]="sortField() === 'sector'">{{ getSortIcon('sector') }}</mat-icon>
+              </div>
+            </th>
+            <th
+              scope="col"
+              class="th-contact th-sortable"
+              [attr.aria-sort]="getAriaSort('contact')"
+              (click)="toggleSort('contact')"
+              (keydown.enter)="toggleSort('contact')"
+              (keydown.space)="toggleSort('contact'); $event.preventDefault()"
+              tabindex="0"
+              role="columnheader"
+              title="Trier par contact principal">
+              <div class="th-header-label">
+                <span>Contact principal</span>
+                <mat-icon class="sort-icon" [class.sort-active]="sortField() === 'contact'">{{ getSortIcon('contact') }}</mat-icon>
+              </div>
+            </th>
+            <th
+              scope="col"
+              class="th-phone th-sortable"
+              [attr.aria-sort]="getAriaSort('phone')"
+              (click)="toggleSort('phone')"
+              (keydown.enter)="toggleSort('phone')"
+              (keydown.space)="toggleSort('phone'); $event.preventDefault()"
+              tabindex="0"
+              role="columnheader"
+              title="Trier par téléphone">
+              <div class="th-header-label">
+                <span>Téléphone</span>
+                <mat-icon class="sort-icon" [class.sort-active]="sortField() === 'phone'">{{ getSortIcon('phone') }}</mat-icon>
+              </div>
+            </th>
+            <th
+              scope="col"
+              class="th-email th-sortable"
+              [attr.aria-sort]="getAriaSort('email')"
+              (click)="toggleSort('email')"
+              (keydown.enter)="toggleSort('email')"
+              (keydown.space)="toggleSort('email'); $event.preventDefault()"
+              tabindex="0"
+              role="columnheader"
+              title="Trier par email">
+              <div class="th-header-label">
+                <span>Email</span>
+                <mat-icon class="sort-icon" [class.sort-active]="sortField() === 'email'">{{ getSortIcon('email') }}</mat-icon>
+              </div>
+            </th>
+            <th
+              scope="col"
+              class="th-assignee th-sortable"
+              [attr.aria-sort]="getAriaSort('assignee')"
+              (click)="toggleSort('assignee')"
+              (keydown.enter)="toggleSort('assignee')"
+              (keydown.space)="toggleSort('assignee'); $event.preventDefault()"
+              tabindex="0"
+              role="columnheader"
+              title="Trier par commercial">
+              <div class="th-header-label">
+                <span>Commercial</span>
+                <mat-icon class="sort-icon" [class.sort-active]="sortField() === 'assignee'">{{ getSortIcon('assignee') }}</mat-icon>
+              </div>
+            </th>
+            <th
+              scope="col"
+              class="th-status th-sortable"
+              [attr.aria-sort]="getAriaSort('status')"
+              (click)="toggleSort('status')"
+              (keydown.enter)="toggleSort('status')"
+              (keydown.space)="toggleSort('status'); $event.preventDefault()"
+              tabindex="0"
+              role="columnheader"
+              title="Trier par statut">
+              <div class="th-header-label">
+                <span>Statut</span>
+                <mat-icon class="sort-icon" [class.sort-active]="sortField() === 'status'">{{ getSortIcon('status') }}</mat-icon>
+              </div>
+            </th>
+          </tr>
+        </thead>
+        <tbody>
+          @for (prospect of sortedProspects(); track prospect.id) {
+            <tr
+              class="odoo-data-row select-none cursor-pointer"
+              [class.odoo-row-selected]="isSelected(prospect.id)"
+              (dblclick)="openEdit(prospect)"
+              title="Double-cliquer pour modifier">
+              <td class="td-checkbox">
+                <input
+                  type="checkbox"
+                  class="odoo-checkbox"
+                  [checked]="isSelected(prospect.id)"
+                  (change)="toggleSelect(prospect.id); $event.stopPropagation()"
+                  (dblclick)="$event.stopPropagation()"
+                  [attr.aria-label]="'Sélectionner ' + (prospect.companyName || prospect.name)"
+                />
+              </td>
+              <td class="td-client">
+                <div class="client-cell">
+                  <div class="company-avatar" [style.background-color]="getAvatarBg(prospect.companyName || prospect.name)">
+                    <span>{{ getMonogram(prospect.companyName || prospect.name) }}</span>
+                  </div>
+                  <div class="client-text">
+                    <strong class="company-name">{{ prospect.companyName || prospect.name }}</strong>
+                    <small class="company-sub">{{ prospect.sector || prospect.source || 'Client' }}</small>
+                  </div>
+                </div>
+              </td>
+              <td class="td-country">
+                <div class="country-cell">
+                  @if (getCountryFlag(prospect.country || prospect.notes)) {
+                    <img
+                      class="country-flag"
+                      [src]="getCountryFlag(prospect.country || prospect.notes)"
+                      [alt]="'Drapeau ' + (prospect.country || prospect.notes || 'pays')"
+                      width="20"
+                      height="15"
+                      loading="lazy"
+                      referrerpolicy="no-referrer"
+                    />
+                  }
+                  <span class="country-name">{{ prospect.country || prospect.notes || '—' }}</span>
+                </div>
+              </td>
+              <td class="td-sector">
+                <span class="sector-text">{{ prospect.sector || prospect.source || '—' }}</span>
+              </td>
+              <td class="td-contact">
+                <div class="contact-text">
+                  <strong class="contact-name">{{ prospect.contactName || '—' }}</strong>
+                  @if (prospect.contactRole) {
+                    <small class="contact-sub">{{ prospect.contactRole }}</small>
+                  }
+                </div>
+              </td>
+              <td class="td-phone">
+                <span class="phone-text">{{ prospect.phone || '—' }}</span>
+              </td>
+              <td class="td-email">
+                @if (prospect.email) {
+                  <a [href]="'mailto:' + prospect.email" class="email-text" (dblclick)="$event.stopPropagation()">{{ prospect.email }}</a>
+                } @else {
+                  <span class="email-empty">—</span>
+                }
+              </td>
+              <td class="td-assignee">
+                <span class="text-xs text-slate-600 dark:text-slate-300">{{ assigneeName(prospect.assignedTo) }}</span>
+              </td>
+              <td class="td-status">
+                <span class="status-pill" [class]="getDisplayStatus(prospect.status).class">
+                  {{ getDisplayStatus(prospect.status).label }}
+                </span>
+              </td>
+            </tr>
+          } @empty {
+            <tr>
+              <td class="empty-state" colspan="9">Aucun prospect ne correspond aux critères.</td>
+            </tr>
+          }
+        </tbody>
+      </table>
+    </div>
+  } @else {
+    <div class="kanban-board" aria-label="Prospects par étape">
+      @for (column of statusColumns(); track column.value) {
+        <section class="kanban-column" [attr.aria-label]="column.label">
+          <header><h2>{{ column.label }}</h2><span>{{ column.prospects.length }}</span></header>
+          @for (prospect of column.prospects; track prospect.id) {
+            <article class="prospect-card">
+              <div class="prospect-card-heading">
+                <div class="client-cell">
+                  <div class="company-avatar" [style.background-color]="getAvatarBg(prospect.companyName || prospect.name)">
+                    <span>{{ getMonogram(prospect.companyName || prospect.name) }}</span>
+                  </div>
+                  <h3>{{ prospect.companyName || prospect.name }}</h3>
+                </div>
+                @if (canUpdate()) {
+                  <button type="button" class="icon-action" [attr.aria-label]="'Modifier ' + (prospect.companyName || prospect.name)" title="Modifier" (click)="openEdit(prospect)"><mat-icon>edit</mat-icon></button>
+                }
+              </div>
+              <div class="country-cell mb-2">
+                @if (getCountryFlag(prospect.country || prospect.notes)) {
+                  <img
+                    class="country-flag"
+                    [src]="getCountryFlag(prospect.country || prospect.notes)"
+                    [alt]="'Drapeau ' + (prospect.country || 'pays')"
+                    width="18"
+                    height="13"
+                    loading="lazy"
+                    referrerpolicy="no-referrer"
+                  />
+                }
+                <span class="country-name">{{ prospect.country || prospect.notes || '—' }}</span>
+              </div>
+              <p>{{ prospect.contactName || prospect.email || 'Contact non renseigné' }}</p>
+              <p class="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                <mat-icon class="!h-3.5 !w-3.5 !text-[13px] align-middle mr-0.5 text-slate-400">person</mat-icon>
+                <span>{{ assigneeName(prospect.assignedTo) }}</span>
+              </p>
+              <footer>
+                <span class="status-pill" [class]="getDisplayStatus(prospect.status).class">{{ getDisplayStatus(prospect.status).label }}</span>
+                <strong>{{ formatValue(prospect.estimatedValue, prospect.currency) }}</strong>
+              </footer>
+            </article>
+          } @empty {
+            <p class="column-empty">Aucun prospect</p>
+          }
+        </section>
+      }
+    </div>
+  }
+
+  @if (isModalOpen()) {
+    <div class="modal-backdrop" role="presentation" (click)="closeModal()">
+      <section class="prospect-modal" cdkTrapFocus cdkTrapFocusAutoCapture role="dialog" aria-modal="true" aria-labelledby="prospect-modal-title" (click)="$event.stopPropagation()" (keydown.escape)="closeModal()">
+        <header>
+          <div>
+            <p class="prospects-eyebrow">Fiche commerciale</p>
+            <h2 id="prospect-modal-title">{{ editingId() ? 'Modifier le prospect' : 'Nouveau prospect' }}</h2>
+          </div>
+          <button type="button" class="icon-action" aria-label="Fermer" title="Fermer" [disabled]="isSaving()" (click)="closeModal()"><mat-icon>close</mat-icon></button>
+        </header>
+        @if (formError()) { <p class="feedback feedback-error" role="alert">{{ formError() }}</p> }
+        <form [formGroup]="form" (ngSubmit)="saveProspect()">
+          <div class="form-grid">
+            <!-- Ligne 1 : Société | Contact principal -->
+            <label class="field" for="prospect-company-name">
+              Société *
+              <input
+                id="prospect-company-name"
+                name="companyName"
+                formControlName="companyName"
+                autocomplete="organization"
+                placeholder="Nom de l'entreprise" />
+              @if (form.controls.companyName.touched && form.controls.companyName.invalid) {
+                <small class="field-error">La société est obligatoire (au moins 2 caractères).</small>
+              }
+            </label>
+            <label class="field" for="prospect-contact-name">
+              Contact principal
+              <input
+                id="prospect-contact-name"
+                name="contactName"
+                formControlName="contactName"
+                autocomplete="name"
+                placeholder="Nom du contact" />
+            </label>
+
+            <!-- Ligne 2 : Fonction du contact | Secteur d'activité -->
+            <label class="field" for="prospect-contact-role">
+              Fonction du contact
+              <input
+                id="prospect-contact-role"
+                name="contactRole"
+                formControlName="contactRole"
+                placeholder="Ex: Directeur commercial, Responsable logistique…" />
+            </label>
+            <label class="field" for="prospect-sector">
+              Secteur d'activité
+              <input
+                id="prospect-sector"
+                name="sector"
+                formControlName="sector"
+                placeholder="Ex: Commerce international, Logistique, Transit…" />
+            </label>
+
+            <!-- Ligne 3 : Pays | Téléphone -->
+            <label class="field" for="prospect-country">
+              Pays
+              <input
+                id="prospect-country"
+                name="country"
+                formControlName="country"
+                autocomplete="country-name"
+                placeholder="Ex: Cameroun, Côte d'Ivoire, France, Nigeria…" />
+            </label>
+            <label class="field" for="prospect-phone">
+              Téléphone
+              <input
+                type="tel"
+                id="prospect-phone"
+                name="phone"
+                formControlName="phone"
+                autocomplete="tel"
+                placeholder="+237 6..." />
+            </label>
+
+            <!-- Ligne 4 : E-mail | Commercial attribué -->
+            <label class="field" for="prospect-email">
+              E-mail
+              <input
+                type="email"
+                id="prospect-email"
+                name="email"
+                formControlName="email"
+                autocomplete="email"
+                placeholder="contact@exemple.com" />
+              @if (form.controls.email.touched && form.controls.email.invalid) {
+                <small class="field-error">Adresse e-mail invalide.</small>
+              }
+            </label>
+            <label class="field" for="prospect-assigned-to">
+              Commercial attribué
+              <select
+                id="prospect-assigned-to"
+                name="assignedTo"
+                formControlName="assignedTo"
+                aria-label="Commercial attribué"
+                class="h-9 w-full rounded border border-slate-300 dark:border-white/20 bg-white dark:bg-[#142a4a] px-2.5 py-1.5 text-xs text-slate-800 dark:text-white transition focus:border-[#0b5ed7] focus:outline-none focus:ring-2 focus:ring-[#0b5ed7]/15">
+                <option [ngValue]="null">Non attribué</option>
+                @for (assignee of prospectService.assignees(); track assignee.id) {
+                  <option [value]="assignee.id">
+                    {{ assignee.firstName }} {{ assignee.lastName }} ({{ assignee.email }})
+                  </option>
+                }
+              </select>
+            </label>
+          </div>
+          <footer class="modal-actions">
+            <button type="button" class="secondary-action" [disabled]="isSaving()" (click)="closeModal()">Annuler</button>
+            <button type="submit" class="primary-action" [disabled]="isSaving() || form.invalid">
+              <mat-icon>{{ isSaving() ? 'progress_activity' : 'save' }}</mat-icon>
+              <span>{{ isSaving() ? 'Enregistrement…' : 'Enregistrer' }}</span>
+            </button>
+          </footer>
+        </form>
+      </section>
+    </div>
+  }
+</main>

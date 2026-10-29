@@ -1,12 +1,16 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { ComponentFixture, TestBed } from '@angular/core/testing';
 import { provideRouter } from '@angular/router';
 import { signal } from '@angular/core';
 import { DashboardManager } from './dashboard-manager';
 import { AuthService } from '../../../core/services/auth.service';
 import { CashierService } from '../../../core/services/cashier.service';
+import { JournalService } from '../../../core/services/journal.service';
+import { JournalEntryService } from '../../../core/services/journal-entry.service';
+import { DossierService } from '../../../core/services/dossier.service';
 import { UserProfile } from '../../../core/models/auth.model';
 import { CashierTransaction } from '../../../core/models/cashier-transaction.model';
+import { DossierExpenseSummary } from '../../../core/models/dossier.model';
 
 describe('DashboardManager', () => {
   let component: DashboardManager;
@@ -30,6 +34,7 @@ describe('DashboardManager', () => {
       service: 'DG',
       typeDescription: 'Dotation',
       category: 'entree',
+      status: 'posted',
       firstName: 'Jean',
       quantity: 1,
       montant: 500000,
@@ -41,6 +46,7 @@ describe('DashboardManager', () => {
       service: 'TRANSPORT',
       typeDescription: 'Camion 01',
       category: 'sortie',
+      status: 'posted',
       firstName: 'Paul',
       quantity: 1,
       montant: -50000,
@@ -50,6 +56,9 @@ describe('DashboardManager', () => {
   const currentUserSignal = signal<UserProfile | null>(mockManagerUser);
   const transactionsSignal = signal<CashierTransaction[]>(mockTransactions);
   const balanceSignal = signal<number>(450000);
+  const isLoadingSignal = signal(false);
+  const journalBalanceRefreshVersionSignal = signal(0);
+  const dossierExpenseSummarySignal = signal<DossierExpenseSummary[]>([]);
 
   const authServiceMock = {
     currentUser: currentUserSignal,
@@ -57,17 +66,45 @@ describe('DashboardManager', () => {
 
   const cashierServiceMock = {
     allTransactions: transactionsSignal,
+    caisseTransactions: transactionsSignal,
     currentBalance: balanceSignal,
+    caisseBalance: balanceSignal,
+    isLoading: isLoadingSignal,
+    journalBalanceRefreshVersion: journalBalanceRefreshVersionSignal,
     loadTransactions: () => Promise.resolve(),
   };
 
+  const journalServiceMock = {
+    activeJournals: signal([]),
+    loadJournals: () => Promise.resolve(),
+  };
+
+  const journalEntryServiceMock = {
+    getChartData: () => Promise.resolve(null),
+  };
+
+  const dossierServiceMock = {
+    expenseSummary: dossierExpenseSummarySignal,
+    expenseSummaryError: signal<string | null>(null),
+    isExpenseSummaryLoading: signal(false),
+    loadExpenseSummary: vi.fn().mockResolvedValue(true),
+  };
+
   beforeEach(async () => {
+    transactionsSignal.set(mockTransactions);
+    balanceSignal.set(450000);
+    isLoadingSignal.set(false);
+    dossierExpenseSummarySignal.set([]);
+
     await TestBed.configureTestingModule({
       imports: [DashboardManager],
       providers: [
         provideRouter([]),
         { provide: AuthService, useValue: authServiceMock },
         { provide: CashierService, useValue: cashierServiceMock },
+        { provide: JournalService, useValue: journalServiceMock },
+        { provide: JournalEntryService, useValue: journalEntryServiceMock },
+        { provide: DossierService, useValue: dossierServiceMock },
       ],
     }).compileComponents();
 
@@ -85,6 +122,102 @@ describe('DashboardManager', () => {
     expect(component.formatCurrency(450000)).toContain('FCFA');
   });
 
+  it('should summarize loaded operation statuses and posted expenses', () => {
+    transactionsSignal.set([
+      ...mockTransactions,
+      {
+        id: 'tx-3',
+        date: '2026-03-03',
+        libelle: 'Carburant transport',
+        service: 'TRANSPORT',
+        category: 'sortie',
+        status: 'posted',
+        montant: -25000,
+      },
+      {
+        id: 'tx-4',
+        date: '2026-03-04',
+        libelle: 'Frais en brouillon',
+        service: 'TRANSPORT',
+        category: 'sortie',
+        status: 'draft',
+        montant: -8000,
+      },
+      {
+        id: 'tx-5',
+        date: '2026-03-05',
+        libelle: 'Carburant annulé',
+        service: 'DG',
+        category: 'sortie',
+        status: 'cancelled',
+        montant: -10000,
+      },
+    ]);
+    fixture.detectChanges();
+
+    expect(component.loadedOperationCount()).toBe(5);
+    expect(component.operationStatusMetrics().map(({ key, count }) => [key, count])).toEqual([
+      ['posted', 3],
+      ['draft', 1],
+      ['cancelled', 1],
+    ]);
+    expect(component.operationStatusRing()).toContain('conic-gradient(');
+    expect(component.expensesByService()).toEqual([
+      { name: 'TRANSPORT', total: 75000, percent: 100 },
+    ]);
+    expect(component.topExpenses()).toEqual([
+      { label: 'Carburant transport', operationCount: 2, total: 75000, percent: 100 },
+    ]);
+    expect(fixture.nativeElement.textContent).toContain('Opérations par statut');
+    expect(fixture.nativeElement.textContent).toContain('Dépenses par service');
+    expect(fixture.nativeElement.textContent).toContain('Principales dépenses');
+    expect(fixture.nativeElement.textContent).not.toContain('Frais en brouillon');
+    expect(fixture.nativeElement.textContent).not.toContain('Carburant annulé');
+  });
+
+  it('should show empty states when no transactions are loaded', () => {
+    transactionsSignal.set([]);
+    fixture.detectChanges();
+
+    expect(component.loadedOperationCount()).toBe(0);
+    expect(component.operationStatusRing()).toBe('conic-gradient(#e8dfca 0deg 360deg)');
+    expect(component.expensesByService()).toEqual([]);
+    expect(component.topExpenses()).toEqual([]);
+    expect(fixture.nativeElement.textContent).toContain('Aucune dépense comptabilisée dans les opérations chargées.');
+  });
+
+  it('should show loading states before the first transaction response', () => {
+    transactionsSignal.set([]);
+    isLoadingSignal.set(true);
+    fixture.detectChanges();
+
+    expect(fixture.nativeElement.textContent).toContain('Chargement des opérations de caisse…');
+    expect(fixture.nativeElement.textContent).not.toContain('Aucune dépense comptabilisée dans les opérations chargées.');
+  });
+
+  it('should display dossier expenses and compute the overall total', () => {
+    dossierExpenseSummarySignal.set([{
+      id: 'dossier-1',
+      prospectId: 'prospect-1',
+      noDossier: 'DOS-001',
+      client: 'Client test',
+      statut: 'ouvert',
+      description: null,
+      createdBy: null,
+      assignedTo: null,
+      createdAt: '',
+      updatedAt: '',
+      expenseCount: 2,
+      totalExpenses: 125000,
+    }]);
+    fixture.detectChanges();
+
+    expect(component.totalDossierExpenses()).toBe(125000);
+    expect(component.totalDossierExpenseCount()).toBe(2);
+    expect(fixture.nativeElement.textContent).toContain('DOS-001');
+    expect(fixture.nativeElement.textContent).toContain('Client test');
+  });
+
   it('should compute chart timeline data correctly from transactions', () => {
     const data = component.chartData();
     expect(data.labels.length).toBe(2);
@@ -94,13 +227,13 @@ describe('DashboardManager', () => {
     expect(data.descriptions[0]).toBe('Approvisionnement caisse');
   });
 
-  it('should handle empty transactions gracefully with default chart data', () => {
+  it('should preserve the server balance when no transactions are loaded', () => {
     transactionsSignal.set([]);
     fixture.detectChanges();
 
     const data = component.chartData();
-    expect(data.labels).toEqual(['Départ', 'Aujourd’hui']);
-    expect(data.balances).toEqual([0, 0]);
+    expect(data.labels).toEqual(['Solde antérieur', 'Aujourd’hui']);
+    expect(data.balances).toEqual([450000, 450000]);
 
     // Restore transactions
     transactionsSignal.set(mockTransactions);
@@ -115,6 +248,7 @@ describe('DashboardManager', () => {
         service: 'DG',
         typeDescription: 'Test',
         category: 'sortie',
+        status: 'posted',
         firstName: 'Jean',
         quantity: 1,
         montant: -20000,
@@ -126,11 +260,13 @@ describe('DashboardManager', () => {
         service: 'DG',
         typeDescription: 'Test',
         category: 'entree',
+        status: 'posted',
         firstName: 'Jean',
         quantity: 1,
         montant: 100000,
       },
     ]);
+    balanceSignal.set(80000);
     fixture.detectChanges();
 
     const data = component.chartData();
@@ -139,6 +275,7 @@ describe('DashboardManager', () => {
 
     // Restore
     transactionsSignal.set(mockTransactions);
+    balanceSignal.set(450000);
   });
 
   it('should process same-day transactions with entree before sortie so chart starts positive', () => {
@@ -150,6 +287,7 @@ describe('DashboardManager', () => {
         service: 'DG',
         typeDescription: 'Dépense',
         category: 'sortie',
+        status: 'posted',
         firstName: 'Paul',
         quantity: 1,
         montant: -457892,
@@ -161,11 +299,13 @@ describe('DashboardManager', () => {
         service: 'DG',
         typeDescription: 'Approvisionnement',
         category: 'entree',
+        status: 'posted',
         firstName: 'Paul',
         quantity: 1,
         montant: 500000,
       },
     ]);
+    balanceSignal.set(42108);
     fixture.detectChanges();
 
     const data = component.chartData();
@@ -174,12 +314,37 @@ describe('DashboardManager', () => {
 
     // Restore
     transactionsSignal.set(mockTransactions);
+    balanceSignal.set(450000);
+  });
+
+  it('should exclude draft and cancelled transactions from the chart balance', () => {
+    transactionsSignal.set([
+      ...mockTransactions,
+      {
+        id: 'tx-draft',
+        date: '2026-03-03',
+        libelle: 'Brouillon',
+        category: 'entree',
+        status: 'draft',
+        montant: 300000,
+      },
+      {
+        id: 'tx-cancelled',
+        date: '2026-03-04',
+        libelle: 'Opération annulée',
+        category: 'sortie',
+        status: 'cancelled',
+        montant: -100000,
+      },
+    ]);
+    fixture.detectChanges();
+
+    const data = component.chartData();
+    expect(data.labels.length).toBe(2);
+    expect(data.balances).toEqual([500000, 450000]);
   });
 
   it('should clean up chart instance on destroy without throwing', () => {
     expect(() => component.ngOnDestroy()).not.toThrow();
   });
 });
-
-
-

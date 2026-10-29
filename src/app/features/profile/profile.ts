@@ -1,9 +1,35 @@
 import { ChangeDetectionStrategy, Component, inject, signal } from '@angular/core';
-import { FormControl, FormGroup, ReactiveFormsModule, Validators } from '@angular/forms';
+import { AbstractControl, FormControl, FormGroup, ReactiveFormsModule, ValidationErrors, ValidatorFn, Validators } from '@angular/forms';
 import { SlicePipe } from '@angular/common';
-import { ROLE_DEFINITIONS } from '../../core/models/auth.model';
+import { ROLE_DEFINITIONS, UserProfile } from '../../core/models/auth.model';
 import { AuthService } from '../../core/services/auth.service';
 import { UserService } from '../../core/services/user.service';
+
+/**
+ * Validateur de complexité de mot de passe :
+ * Exige au moins 8 caractères, une lettre et un chiffre.
+ */
+export function strongPasswordValidator(): ValidatorFn {
+  return (control: AbstractControl): ValidationErrors | null => {
+    const value = control.value;
+    if (!value) return null;
+
+    const hasLetter = /[a-zA-Z]/.test(value);
+    const hasDigit = /[0-9]/.test(value);
+    const isMinLength = value.length >= 8;
+
+    if (!hasLetter || !hasDigit || !isMinLength) {
+      return {
+        strongPassword: {
+          hasLetter,
+          hasDigit,
+          isMinLength,
+        },
+      };
+    }
+    return null;
+  };
+}
 
 @Component({
   selector: 'app-profile',
@@ -48,13 +74,23 @@ export class Profile {
     }),
     newPassword: new FormControl<string>('', {
       nonNullable: true,
-      validators: [Validators.required, Validators.minLength(6)],
+      validators: [Validators.required, Validators.minLength(8), strongPasswordValidator()],
     }),
     confirmPassword: new FormControl<string>('', {
       nonNullable: true,
-      validators: [Validators.required, Validators.minLength(6)],
+      validators: [Validators.required, Validators.minLength(8)],
     }),
   });
+
+  /**
+   * Retourne le libellé du rôle à afficher dans le badge :
+   * Priorise le libellé attribué par les rôles d'accès RBAC (ex: "DAF"),
+   * puis l'identifiant personnalisé de rôle, puis enfin le rôle canonique (ex: "Employé").
+   */
+  public getRoleDisplay(user: UserProfile | undefined): string {
+    if (!user) return '';
+    return user.roleLabel || user.customRole || this.getRoleLabel(user.role);
+  }
 
   public getRoleLabel(role: string | undefined): string {
     if (!role) return '';
@@ -100,7 +136,7 @@ export class Profile {
 
     this.profileError.set(null);
     this.isSavedSuccess.set(true);
-    setTimeout(() => this.isSavedSuccess.set(false), 3000);
+    setTimeout(() => this.isSavedSuccess.set(false), 15000);
   }
 
   public async onSavePassword(): Promise<void> {
@@ -128,6 +164,6 @@ export class Profile {
     this.passwordError.set(null);
     this.isPasswordSuccess.set(true);
     this.passwordForm.reset();
-    setTimeout(() => this.isPasswordSuccess.set(false), 3000);
+    setTimeout(() => this.isPasswordSuccess.set(false), 15000);
   }
 }

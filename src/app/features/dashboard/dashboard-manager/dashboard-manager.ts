@@ -6,10 +6,13 @@ import {
   OnDestroy,
   OnInit,
   PLATFORM_ID,
+  QueryList,
   ViewChild,
+  ViewChildren,
   computed,
   effect,
   inject,
+  signal,
 } from '@angular/core';
 import { isPlatformBrowser } from '@angular/common';
 import { RouterLink } from '@angular/router';
@@ -27,6 +30,11 @@ import {
 } from 'chart.js';
 import { AuthService } from '../../../core/services/auth.service';
 import { CashierService } from '../../../core/services/cashier.service';
+import { JournalService } from '../../../core/services/journal.service';
+import { JournalEntryService } from '../../../core/services/journal-entry.service';
+import { DossierService } from '../../../core/services/dossier.service';
+import { Journal } from '../../../core/models/journal.model';
+import { JournalChartData } from '../../../core/models/journal-entry.model';
 
 // Enregistrement des composants nécessaires de Chart.js
 Chart.register(
@@ -62,6 +70,26 @@ export interface CaisseTimelineData {
   descriptions: string[];
 }
 
+interface OperationStatusMetric {
+  key: 'posted' | 'draft' | 'cancelled';
+  label: string;
+  count: number;
+  color: string;
+}
+
+interface ExpenseServiceMetric {
+  name: string;
+  total: number;
+  percent: number;
+}
+
+interface TopExpenseMetric {
+  label: string;
+  operationCount: number;
+  total: number;
+  percent: number;
+}
+
 @Component({
   selector: 'app-dashboard-manager',
   imports: [RouterLink, MatIconModule],
@@ -73,31 +101,131 @@ export class DashboardManager implements OnInit, AfterViewInit, OnDestroy {
   @ViewChild('caisseChartCanvas')
   private readonly caisseChartCanvas?: ElementRef<HTMLCanvasElement>;
 
+  @ViewChildren('journalChartCanvas')
+  private readonly journalChartCanvases?: QueryList<ElementRef<HTMLCanvasElement>>;
+
   private readonly authService = inject(AuthService);
   private readonly cashierService = inject(CashierService);
+  private readonly journalService = inject(JournalService, { optional: true });
+  private readonly journalEntryService = inject(JournalEntryService);
+  private readonly dossierService = inject(DossierService);
   private readonly platformId = inject(PLATFORM_ID);
 
   public readonly currentUser = this.authService.currentUser;
-  public readonly allTransactions = this.cashierService.allTransactions;
-  public readonly currentBalance = this.cashierService.currentBalance;
+  public readonly caisseTransactions = this.cashierService.caisseTransactions;
+  public readonly caisseBalance = this.cashierService.caisseBalance;
+  public readonly isCaisseLoading = this.cashierService.isLoading;
+  public readonly canViewDossierExpenseSummary = computed(() => this.currentUser()?.role === 'manager');
+  public readonly dossierExpenseSummary = this.dossierService.expenseSummary;
+  public readonly dossierExpenseSummaryError = this.dossierService.expenseSummaryError;
+  public readonly isDossierExpenseSummaryLoading = this.dossierService.isExpenseSummaryLoading;
+  public readonly totalDossierExpenses = computed(() =>
+    this.dossierExpenseSummary().reduce((total, dossier) => total + dossier.totalExpenses, 0)
+  );
+  public readonly totalDossierExpenseCount = computed(() =>
+    this.dossierExpenseSummary().reduce((total, dossier) => total + dossier.expenseCount, 0)
+  );
+  public readonly operationStatusMetrics = computed<OperationStatusMetric[]>(() => {
+    const transactions = this.caisseTransactions();
+    const metrics: OperationStatusMetric[] = [
+      { key: 'posted', label: 'Comptabilisées', count: 0, color: '#292727' },
+      { key: 'draft', label: 'Brouillons', count: 0, color: '#e2b83f' },
+      { key: 'cancelled', label: 'Annulées', count: 0, color: '#e8dfca' },
+    ];
+    return metrics.map((metric) => ({
+      ...metric,
+      count: transactions.filter((transaction) => transaction.status === metric.key).length,
+    }));
+  });
+  public readonly loadedOperationCount = computed(() => this.caisseTransactions().length);
+  public readonly operationStatusRing = computed(() => {
+    const metrics = this.operationStatusMetrics();
+    const total = metrics.reduce((sum, metric) => sum + metric.count, 0);
+    if (total === 0) return 'conic-gradient(#e8dfca 0deg 360deg)';
 
-  private chartInstance: Chart | null = null;
+    let offset = 0;
+    const segments = metrics.map((metric) => {
+      const end = offset + metric.count / total * 360;
+      const segment = `${metric.color} ${offset}deg ${end}deg`;
+      offset = end;
+      return segment;
+    });
+    return `conic-gradient(${segments.join(', ')})`;
+  });
+  public readonly expensesByService = computed<ExpenseServiceMetric[]>(() => {
+    const totals = new Map<string, number>();
+    for (const transaction of this.caisseTransactions()) {
+      if (transaction.status !== 'posted' || transaction.category !== 'sortie') continue;
+      const service = transaction.service?.trim() || 'Sans service';
+      totals.set(service, (totals.get(service) || 0) + Math.abs(Number(transaction.montant) || 0));
+    }
 
-  // Préparation réactive des données chronologiques pour Chart.js
+    const sorted = [...totals.entries()]
+      .map(([name, total]) => ({ name, total }))
+      .sort((left, right) => right.total - left.total || left.name.localeCompare(right.name, 'fr'))
+      .slice(0, 4);
+    const maxTotal = sorted[0]?.total || 0;
+    return sorted.map((metric) => ({
+      ...metric,
+      percent: maxTotal > 0 ? metric.total / maxTotal * 100 : 0,
+    }));
+  });
+  public readonly topExpenses = computed<TopExpenseMetric[]>(() => {
+    const expenses = new Map<string, { operationCount: number; total: number }>();
+    for (const transaction of this.caisseTransactions()) {
+      if (transaction.status !== 'posted' || transaction.category !== 'sortie') continue;
+      const label = transaction.libelle.trim() || 'Dépense sans libellé';
+      const metric = expenses.get(label) || { operationCount: 0, total: 0 };
+      metric.operationCount += 1;
+      metric.total += Math.abs(Number(transaction.montant) || 0);
+      expenses.set(label, metric);
+    }
+
+    const sorted = [...expenses.entries()]
+      .map(([label, metric]) => ({ label, ...metric }))
+      .sort((left, right) => right.total - left.total || left.label.localeCompare(right.label, 'fr'))
+      .slice(0, 5);
+    const maxTotal = sorted[0]?.total || 0;
+    return sorted.map((metric) => ({
+      ...metric,
+      percent: maxTotal > 0 ? metric.total / maxTotal * 100 : 0,
+    }));
+  });
+
+  // Données de graphiques en cache par journal
+  private readonly journalChartsMap = new Map<string, Chart>();
+  private readonly journalChartDataMap = signal<Record<string, JournalChartData>>({});
+
+  // Journaux additionnels actifs créés depuis le sous-module de configuration
+  public readonly additionalJournals = computed<Journal[]>(() => {
+    if (!this.journalService) return [];
+    return this.journalService
+      .activeJournals()
+      .filter(
+        (j) =>
+          j.sequence_prefix !== 'CSH1' &&
+          j.id !== 'native-caisse-principal' &&
+          !j.name.toLowerCase().includes('caisse principale')
+      );
+  });
+
+  private caisseChartInstance: Chart | null = null;
+  private caisseChartCanvasObserver: MutationObserver | null = null;
+
+  // Préparation réactive des données chronologiques pour Chart.js (Caisse Principale exclusivement)
   public readonly chartData = computed<CaisseTimelineData>(() => {
-    const list = [...this.allTransactions()].sort((a, b) => {
+    const currentBalance = Number(this.caisseBalance()) || 0;
+    const list = this.caisseTransactions().filter((tx) => tx.status === 'posted').sort((a, b) => {
       const dateA = parseTransactionDate(a.date).getTime();
       const dateB = parseTransactionDate(b.date).getTime();
       if (dateA !== dateB) {
         return dateA - dateB;
       }
-      // Si même date : privilégier l'heure de création
       const createdA = a.createdAt ? new Date(a.createdAt).getTime() : 0;
       const createdB = b.createdAt ? new Date(b.createdAt).getTime() : 0;
       if (createdA !== createdB && createdA > 0 && createdB > 0) {
         return createdA - createdB;
       }
-      // Règle comptable : à date/heure égale, traiter l'approvisionnement (montant > 0) avant la dépense (montant < 0)
       const isEntreeA = a.category === 'entree' || a.montant > 0 ? 1 : 0;
       const isEntreeB = b.category === 'entree' || b.montant > 0 ? 1 : 0;
       return isEntreeB - isEntreeA;
@@ -105,13 +233,14 @@ export class DashboardManager implements OnInit, AfterViewInit, OnDestroy {
 
     if (list.length === 0) {
       return {
-        labels: ['Départ', 'Aujourd’hui'],
-        balances: [0, 0],
-        descriptions: ['Solde initial', 'Solde actuel'],
+        labels: ['Solde antérieur', 'Aujourd’hui'],
+        balances: [currentBalance, currentBalance],
+        descriptions: ['Solde antérieur', 'Solde actuel'],
       };
     }
 
-    let runningBalance = 0;
+    const loadedBalance = list.reduce((total, tx) => total + (Number(tx.montant) || 0), 0);
+    let runningBalance = currentBalance - loadedBalance;
     const labels: string[] = [];
     const balances: number[] = [];
     const descriptions: string[] = [];
@@ -135,46 +264,88 @@ export class DashboardManager implements OnInit, AfterViewInit, OnDestroy {
   });
 
   constructor() {
-    // Effet réactif mettant à jour Chart.js dès que les données du CashierService changent
+    // Effet réactif mettant à jour le graphique Caisse dès que les données changent
     effect(() => {
       const data = this.chartData();
-      if (this.chartInstance) {
-        this.updateChartData(data);
+      if (this.caisseChartInstance) {
+        this.updateCaisseChartData(data);
+      }
+    });
+
+    // Effet réactif pour synchroniser les graphiques des journaux additionnels
+    effect(() => {
+      const journals = this.additionalJournals();
+      if (isPlatformBrowser(this.platformId) && journals.length > 0) {
+        // Chargement asynchrone des données des journaux
+        void this.loadAllJournalCharts(journals);
+      }
+    });
+
+    effect(() => {
+      const refreshVersion = this.cashierService.journalBalanceRefreshVersion();
+      if (refreshVersion === 0) return;
+
+      const journals = this.additionalJournals();
+      if (isPlatformBrowser(this.platformId) && journals.length > 0) {
+        void this.loadAllJournalCharts(journals);
       }
     });
   }
 
   public ngOnInit(): void {
     void this.cashierService.loadTransactions();
+    if (this.canViewDossierExpenseSummary()) {
+      void this.dossierService.loadExpenseSummary();
+    }
+    if (this.journalService) {
+      void this.journalService.loadJournals();
+    }
   }
 
   public ngAfterViewInit(): void {
-    if (isPlatformBrowser(this.platformId) && this.caisseChartCanvas?.nativeElement) {
-      this.initChart();
+    if (isPlatformBrowser(this.platformId)) {
+      this.caisseChartCanvasObserver = new MutationObserver(() => {
+        const canvas = document.getElementById('caisse-chart-canvas');
+        if (canvas instanceof HTMLCanvasElement && this.caisseChartInstance?.canvas !== canvas) {
+          this.initCaisseChart(canvas);
+        }
+      });
+      this.caisseChartCanvasObserver.observe(document.body, { childList: true, subtree: true });
+      this.initCaisseChart();
+
+      const journals = this.additionalJournals();
+      if (journals.length > 0) {
+        void this.loadAllJournalCharts(journals);
+      }
     }
   }
 
   public ngOnDestroy(): void {
-    if (this.chartInstance) {
-      this.chartInstance.destroy();
-      this.chartInstance = null;
+    this.caisseChartCanvasObserver?.disconnect();
+    this.caisseChartCanvasObserver = null;
+    if (this.caisseChartInstance) {
+      this.caisseChartInstance.destroy();
+      this.caisseChartInstance = null;
     }
+    this.journalChartsMap.forEach((chart) => chart.destroy());
+    this.journalChartsMap.clear();
   }
+  // Initialisation du graphique Caisse Principale
+  private initCaisseChart(canvas = this.caisseChartCanvas?.nativeElement): void {
+    if (!canvas?.isConnected) return;
 
-  // Initialisation du graphique natif Chart.js
-  private initChart(): void {
-    const canvas = this.caisseChartCanvas?.nativeElement;
-    if (!canvas) return;
+    if (this.caisseChartInstance) {
+      this.caisseChartInstance.destroy();
+      this.caisseChartInstance = null;
+    }
 
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
     const data = this.chartData();
-
-    // Dégradé soigné sous la courbe (bleu Transmex)
     const gradient = ctx.createLinearGradient(0, 0, 0, 240);
-    gradient.addColorStop(0, 'rgba(30, 58, 138, 0.22)');
-    gradient.addColorStop(1, 'rgba(30, 58, 138, 0.0)');
+    gradient.addColorStop(0, 'rgba(11, 94, 215, 0.22)');
+    gradient.addColorStop(1, 'rgba(11, 94, 215, 0.0)');
 
     const config: ChartConfiguration<'line'> = {
       type: 'line',
@@ -184,102 +355,182 @@ export class DashboardManager implements OnInit, AfterViewInit, OnDestroy {
           {
             label: 'Solde de caisse',
             data: data.balances,
-            borderColor: '#1e3a8a',
+            borderColor: '#0b5ed7',
             borderWidth: 2.5,
             backgroundColor: gradient,
             fill: true,
             tension: 0.35,
             pointBackgroundColor: '#ffffff',
-            pointBorderColor: '#1e3a8a',
+            pointBorderColor: '#0b5ed7',
             pointBorderWidth: 2,
             pointRadius: 4,
             pointHoverRadius: 7,
-            pointHoverBackgroundColor: '#1e3a8a',
+            pointHoverBackgroundColor: '#0b5ed7',
             pointHoverBorderColor: '#ffffff',
             pointHoverBorderWidth: 2.5,
           },
         ],
       },
-      options: {
-        responsive: true,
-        maintainAspectRatio: false,
-        interaction: {
-          mode: 'index',
-          intersect: false,
-        },
-        plugins: {
-          tooltip: {
-            backgroundColor: 'rgba(15, 23, 42, 0.95)',
-            titleColor: '#cbd5e1',
-            titleFont: { size: 11, weight: 'normal' },
-            bodyColor: '#ffffff',
-            bodyFont: { size: 13, weight: 'bold' },
-            padding: 10,
-            cornerRadius: 10,
-            displayColors: false,
-            callbacks: {
-              label: (context) => {
-                const val = (context.parsed.y as number) ?? 0;
-                const formatted = this.formatCurrency(val);
-                const desc = data.descriptions[context.dataIndex];
-                return desc ? [`${formatted}`, `• ${desc}`] : `${formatted}`;
-              },
-            },
+      options: this.getCommonChartOptions(data.descriptions),
+    };
+
+    this.caisseChartInstance = new Chart(ctx, config);
+  }
+
+  // Charge et affiche les graphiques pour tous les journaux bancaires/additionnels en parallèle
+  private async loadAllJournalCharts(journals: Journal[]): Promise<void> {
+    if (journals.length === 0) return;
+    const results = await Promise.all(
+      journals.map(async (journal) => {
+        const chartData = await this.journalEntryService.getChartData(journal.id);
+        return { journalId: journal.id, chartData };
+      })
+    );
+
+    const updates: Record<string, JournalChartData> = {};
+    for (const item of results) {
+      if (item.chartData) {
+        updates[item.journalId] = item.chartData;
+      }
+    }
+
+    if (Object.keys(updates).length > 0) {
+      this.journalChartDataMap.update((map) => ({
+        ...map,
+        ...updates,
+      }));
+      for (const [journalId, chartData] of Object.entries(updates)) {
+        this.renderOrUpdateJournalChart(journalId, chartData);
+      }
+    }
+  }
+
+  // Rendu spécifique du graphique d'un journal donné
+  public renderOrUpdateJournalChart(journalId: string, data: JournalChartData): void {
+    if (!isPlatformBrowser(this.platformId)) return;
+
+    const canvas = document.getElementById(`chart-canvas-${journalId}`) as HTMLCanvasElement | null;
+    if (!canvas) return;
+
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const existing = this.journalChartsMap.get(journalId);
+    if (existing) {
+      existing.data.labels = data.labels.length > 0 ? data.labels : ['Départ', 'Aujourd’hui'];
+      if (existing.data.datasets[0]) {
+        existing.data.datasets[0].data = data.balances.length > 0 ? data.balances : [0, 0];
+      }
+      existing.update('none');
+      return;
+    }
+
+    const labels = data.labels.length > 0 ? data.labels : ['Départ', 'Aujourd’hui'];
+    const balances = data.balances.length > 0 ? data.balances : [0, 0];
+
+    const gradient = ctx.createLinearGradient(0, 0, 0, 220);
+    gradient.addColorStop(0, 'rgba(11, 94, 215, 0.22)');
+    gradient.addColorStop(1, 'rgba(11, 94, 215, 0.0)');
+
+    const config: ChartConfiguration<'line'> = {
+      type: 'line',
+      data: {
+        labels,
+        datasets: [
+          {
+            label: 'Solde du journal',
+            data: balances,
+            borderColor: '#0b5ed7',
+            borderWidth: 2.2,
+            backgroundColor: gradient,
+            fill: true,
+            tension: 0.35,
+            pointBackgroundColor: '#ffffff',
+            pointBorderColor: '#0b5ed7',
+            pointBorderWidth: 2,
+            pointRadius: 3.5,
+            pointHoverRadius: 6,
+            pointHoverBackgroundColor: '#0b5ed7',
+            pointHoverBorderColor: '#ffffff',
+            pointHoverBorderWidth: 2,
           },
+        ],
+      },
+      options: this.getCommonChartOptions(data.descriptions),
+    };
+
+    const newChart = new Chart(ctx, config);
+    this.journalChartsMap.set(journalId, newChart);
+  }
+
+  private getCommonChartOptions(descriptions: string[]): ChartConfiguration<'line'>['options'] {
+    return {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: {
+        mode: 'index',
+        intersect: false,
+      },
+      plugins: {
+        legend: {
+          display: false,
         },
-        scales: {
-          x: {
-            grid: {
-              display: false,
-            },
-            ticks: {
-              color: '#94a3b8',
-              font: { size: 11 },
-              maxRotation: 0,
-              autoSkip: true,
-              maxTicksLimit: 7,
-            },
-            border: {
-              display: false,
-            },
-          },
-          y: {
-            grid: {
-              color: '#f1f5f9',
-            },
-            ticks: {
-              color: '#94a3b8',
-              font: { size: 11 },
-              callback: (value) => {
-                const num = Number(value);
-                if (Math.abs(num) >= 1000000) {
-                  return `${(num / 1000000).toFixed(1)}M`;
-                }
-                if (Math.abs(num) >= 1000) {
-                  return `${Math.round(num / 1000)}k`;
-                }
-                return num.toString();
-              },
-            },
-            border: {
-              display: false,
+        tooltip: {
+          backgroundColor: 'rgba(15, 23, 42, 0.95)',
+          titleColor: '#cbd5e1',
+          titleFont: { size: 11, weight: 'normal' },
+          bodyColor: '#ffffff',
+          bodyFont: { size: 13, weight: 'bold' },
+          padding: 10,
+          cornerRadius: 10,
+          displayColors: false,
+          callbacks: {
+            label: (context) => {
+              const val = (context.parsed.y as number) ?? 0;
+              const formatted = this.formatCurrency(val);
+              const desc = descriptions[context.dataIndex];
+              return desc ? [`${formatted}`, `• ${desc}`] : `${formatted}`;
             },
           },
         },
       },
+      scales: {
+        x: {
+          grid: { display: false },
+          ticks: {
+            color: '#94a3b8',
+            font: { size: 11 },
+            maxRotation: 0,
+            autoSkip: true,
+            maxTicksLimit: 6,
+          },
+          border: { display: false },
+        },
+        y: {
+          grid: { color: 'rgba(226, 232, 240, 0.5)' },
+          ticks: {
+            color: '#94a3b8',
+            font: { size: 11 },
+            callback: (value) => {
+              const num = Number(value);
+              if (Math.abs(num) >= 1000000) return `${(num / 1000000).toFixed(1)}M`;
+              if (Math.abs(num) >= 1000) return `${Math.round(num / 1000)}k`;
+              return num.toString();
+            },
+          },
+          border: { display: false },
+        },
+      },
     };
-
-    this.chartInstance = new Chart(ctx, config);
   }
 
-  // Mise à jour fluide des données du graphique
-  private updateChartData(data: CaisseTimelineData): void {
-    if (!this.chartInstance) return;
-    this.chartInstance.data.labels = data.labels;
-    if (this.chartInstance.data.datasets[0]) {
-      this.chartInstance.data.datasets[0].data = data.balances;
+  private updateCaisseChartData(data: CaisseTimelineData): void {
+    if (!this.caisseChartInstance) return;
+    this.caisseChartInstance.data.labels = data.labels;
+    if (this.caisseChartInstance.data.datasets[0]) {
+      this.caisseChartInstance.data.datasets[0].data = data.balances;
     }
-    this.chartInstance.update('none');
+    this.caisseChartInstance.update('none');
   }
 
   // Formatage monétaire en FCFA
@@ -289,7 +540,13 @@ export class DashboardManager implements OnInit, AfterViewInit, OnDestroy {
     }).format(amount);
     return `${formatted} FCFA`;
   }
+
+  // Solde propre à un journal spécifique (isolé et garanti)
+  public getJournalBalance(journalId: string): number {
+    const data = this.journalChartDataMap()[journalId];
+    if (data && data.current_balance !== undefined) {
+      return data.current_balance;
+    }
+    return this.journalService?.getJournalBalance(journalId) ?? 0;
+  }
 }
-
-
-

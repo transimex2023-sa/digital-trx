@@ -1,9 +1,15 @@
 import { ComponentFixture, TestBed } from '@angular/core/testing';
+import { provideRouter } from '@angular/router';
+import { signal } from '@angular/core';
 import { CashierManagement } from './cashier-management';
 import { CashierService } from '../../core/services/cashier.service';
 import { SupabaseService } from '../../core/services/supabase.service';
 import { AuthService } from '../../core/services/auth.service';
+import { AccessControlService } from '../../core/services/access-control.service';
 import { NotificationService } from '../../core/services/notification.service';
+import { Journal } from '../../core/models/journal.model';
+import { CashierTransaction } from '../../core/models/cashier-transaction.model';
+import { UserProfile, UserRole } from '../../core/models/auth.model';
 import { vi } from 'vitest';
 
 describe('CashierManagement', () => {
@@ -12,20 +18,54 @@ describe('CashierManagement', () => {
   let service: CashierService;
   let notificationService: NotificationService;
   let originalFetch: typeof globalThis.fetch;
+  const createUser = (role: UserRole, id = 'usr-1'): UserProfile => ({
+    id,
+    email: `${id}@transmex.cm`,
+    firstName: 'Test',
+    lastName: 'User',
+    role,
+    isActive: true,
+    createdAt: '2026-09-29T00:00:00.000Z',
+  });
+  let currentUser = signal<UserProfile | null>(createUser('caissiere'));
+  let currentRole = signal<UserRole>('caissiere');
 
   beforeEach(async () => {
     originalFetch = globalThis.fetch;
+    currentUser = signal<UserProfile | null>(createUser('caissiere'));
+    currentRole = signal<UserRole>('caissiere');
     await TestBed.configureTestingModule({
       imports: [CashierManagement],
       providers: [
+        provideRouter([]),
         CashierService,
         SupabaseService,
         NotificationService,
         {
+          provide: AccessControlService,
+          useValue: {
+            hasPermission: vi.fn((permission: string) =>
+              permission.startsWith('cashier.') && (currentRole() === 'admin' || currentRole() === 'caissiere')
+            ),
+            hasPermissionForResource: vi.fn((_permission: string, resource: { ownerUserId?: string }) => resource.ownerUserId === 'treasurer-1'),
+            effectivePermissions: signal([]),
+            loadMyPermissions: vi.fn().mockResolvedValue(undefined),
+          },
+        },
+        {
           provide: AuthService,
           useValue: {
-            currentUser: () => ({ id: 'usr-1', email: 'caissiere@transmex.cm', role: 'caissiere' }),
-            token: () => 'mock-jwt-token',
+            currentUser,
+            token: signal('mock-jwt-token'),
+            waitForSession: vi.fn().mockResolvedValue(undefined),
+            isAuthenticated: signal(true),
+            currentRole,
+            isAdmin: signal(false),
+            isManager: signal(false),
+            isTresorier: signal(false),
+            isCaissiere: signal(true),
+            isEmploye: signal(false),
+            isComptable: signal(false),
           },
         },
       ],
@@ -81,10 +121,101 @@ describe('CashierManagement', () => {
     expect(component).toBeTruthy();
   });
 
+  it('rend le tableau partagé sans perdre la structure ni les colonnes de la Caisse', () => {
+    const table = fixture.nativeElement.querySelector('#cashier-transactions-table') as HTMLTableElement | null;
+
+    expect(table?.tagName).toBe('TABLE');
+    expect(table?.getAttribute('aria-label')).toBe('Opérations de caisse');
+    expect(table?.classList.contains('odoo-table')).toBe(true);
+    expect([...table!.children].map((element) => element.tagName)).toEqual(['THEAD', 'TBODY']);
+    expect(table?.querySelectorAll('thead th')).toHaveLength(11);
+  });
+
+  it('rend la barre partagée avec les contrôles propres à la Caisse', () => {
+    expect(fixture.nativeElement.querySelector('app-module-control-panel')).not.toBeNull();
+    expect(fixture.nativeElement.querySelector('#cashier-control-create')).not.toBeNull();
+    expect(fixture.nativeElement.querySelector('#cashier-control-import')).not.toBeNull();
+    expect(fixture.nativeElement.querySelector('#cashier-control-search')).not.toBeNull();
+    expect(fixture.nativeElement.querySelector('[aria-label="Pagination des opérations"]')).not.toBeNull();
+  });
+
+  it('masque les actions de création pour un rôle sans droit cashier.create', () => {
+    currentRole.set('tresorier');
+    fixture.detectChanges();
+
+    expect(fixture.nativeElement.querySelector('#cashier-control-create')).toBeNull();
+    expect(fixture.nativeElement.querySelector('#cashier-control-import')).toBeNull();
+    expect(fixture.nativeElement.querySelector('#cashier-control-search')).not.toBeNull();
+  });
+
+  it('affiche le menu d’actions Caisse quand une opération est sélectionnée', () => {
+    const mapped = service.mapDatabaseOperations([{
+      id: 'selected-cashier-action',
+      date: '2026-10-04',
+      libelle: 'Dépense de test',
+      category: 'sortie',
+      status: 'posted',
+      montant: -1000,
+    }]);
+    (service as unknown as { _transactions: { set: (value: unknown) => void } })._transactions.set(mapped);
+    service.toggleSelectTransaction('selected-cashier-action');
+    fixture.detectChanges();
+
+    const actionsButton = fixture.nativeElement.querySelector('#cashier-control-actions') as HTMLButtonElement | null;
+    expect(actionsButton).not.toBeNull();
+    actionsButton?.click();
+    fixture.detectChanges();
+
+    const actionsMenu = fixture.nativeElement.querySelector('[aria-label="Actions sur les opérations sélectionnées"]');
+    expect(actionsMenu?.textContent).toContain('Exporter');
+    expect(actionsMenu?.textContent).toContain('Dupliquer');
+    expect(actionsMenu?.textContent).toContain('Annuler');
+  });
+
   it('devrait être initialisé avec une caisse vide par défaut', () => {
     expect(component.pagedTransactions().length).toBe(0);
     expect(component.currentBalance()).toBe(0);
     expect(component.paginationLabel()).toBe('00-00 / 00');
+  });
+
+  it('réserve les lignes éditables aux caissières sur CSH1 et aux trésoriers sur leurs journaux', () => {
+    const treasurer = createUser('tresorier', 'treasurer-1');
+    currentUser.set(treasurer);
+    currentRole.set('tresorier');
+
+    const cashTransaction = {
+      id: 'cash-entry',
+      date: '2026-09-29',
+      libelle: 'Caisse native',
+      category: 'entree',
+      montant: 100,
+      journalId: 'native-caisse-principal',
+    } as CashierTransaction;
+    expect(component.canEdit()).toBe(false);
+    expect(component.canEditTransaction(cashTransaction)).toBe(false);
+
+    const ownJournal: Journal = {
+      id: 'journal-owned',
+      name: 'Journal du trésorier',
+      type: 'bank',
+      sequence_prefix: 'BANKT',
+      default_account: 'TEST',
+      currency: 'XAF',
+      is_active: true,
+      created_by: treasurer.id,
+    };
+    const journalState = component.journalService as unknown as {
+      _journals: { set: (journals: Journal[]) => void };
+    };
+    journalState._journals.set([ownJournal]);
+    vi.spyOn(service, 'loadJournalEntries').mockResolvedValue(undefined);
+    service.setActiveJournal(ownJournal.id, ownJournal.sequence_prefix);
+
+    expect(component.canEdit()).toBe(true);
+    expect(component.canEditTransaction({ ...cashTransaction, journalId: ownJournal.id, createdBy: 'another-user' })).toBe(true);
+
+    journalState._journals.set([{ ...ownJournal, created_by: 'another-user' }]);
+    expect(component.canEdit()).toBe(false);
   });
 
   it('devrait ouvrir et fermer la ligne de saisie horizontale inline', () => {
@@ -95,6 +226,16 @@ describe('CashierManagement', () => {
 
     component.cancelAddInline();
     expect(component.isAddingRow()).toBe(false);
+  });
+
+  it('garde la ligne de saisie ouverte après le clic sur Nouveau', () => {
+    const createButton = fixture.nativeElement.querySelector('#cashier-control-create') as HTMLButtonElement;
+
+    createButton.click();
+    fixture.detectChanges();
+
+    expect(component.isAddingRow()).toBe(true);
+    expect(fixture.nativeElement.querySelector('#inline-add-row')).not.toBeNull();
   });
 
   it('devrait formater correctement les montants monétaires en FCFA', () => {
@@ -116,7 +257,8 @@ describe('CashierManagement', () => {
 
     expect(component.isAddingRow()).toBe(false);
     expect(service.allTransactions().length).toBe(1);
-    expect(component.currentBalance()).toBe(-25000);
+    expect(service.allTransactions()[0].status).toBe('draft');
+    expect(component.currentBalance()).toBe(0);
   });
 
   it('devrait exiger le numéro de dossier et la quantité lorsque le type est Opérations', async () => {
@@ -204,10 +346,11 @@ describe('CashierManagement', () => {
     const updatedTx = service.allTransactions()[0];
     expect(updatedTx.libelle).toBe('Fournitures de bureau modifiées');
     expect(updatedTx.montant).toBe(-30000);
-    expect(component.currentBalance()).toBe(-30000);
+    expect(updatedTx.status).toBe('draft');
+    expect(component.currentBalance()).toBe(0);
   });
 
-  it('devrait permettre de choisir le statut (Brouillon / Comptabilisé) lors de l’ajout et de la modification', async () => {
+  it('exige le retour en brouillon avant de modifier une pièce comptabilisée', async () => {
     component.startAddInline();
     expect(component.transactionForm.get('status')?.value).toBe('draft');
 
@@ -224,17 +367,24 @@ describe('CashierManagement', () => {
     const createdTx = service.allTransactions()[0];
     expect(createdTx.status).toBe('posted');
 
-    // Modification vers brouillon
+    expect(component.canEditTransaction(createdTx)).toBe(false);
     component.startInlineEdit(createdTx);
-    expect(component.editTransactionForm.get('status')?.value).toBe('posted');
+    expect(component.editingTxId()).toBeNull();
 
-    component.editTransactionForm.patchValue({
-      status: 'draft',
-    });
+    service.toggleSelectTransaction(createdTx.id);
+    await service.resetSelectedToDraft();
+    const draftTx = service.allTransactions()[0];
+    expect(draftTx.status).toBe('draft');
+    expect(component.canEditTransaction(draftTx)).toBe(true);
+
+    await component.startInlineEdit(draftTx);
+    expect(component.editTransactionForm.get('status')?.value).toBe('draft');
+    component.editTransactionForm.patchValue({ libelle: 'Versement corrigé' });
 
     await component.submitInlineEdit();
     const updatedTx = service.allTransactions()[0];
     expect(updatedTx.status).toBe('draft');
+    expect(updatedTx.libelle).toBe('Versement corrigé');
   });
 
   it('devrait afficher une notification d’avertissement lors de la détection d’un doublon', async () => {

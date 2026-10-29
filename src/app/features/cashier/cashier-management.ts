@@ -14,6 +14,7 @@ import {
   signal,
 } from '@angular/core';
 import { isPlatformBrowser } from '@angular/common';
+import { ActivatedRoute, Router } from '@angular/router';
 import {
   FormControl,
   FormGroup,
@@ -32,9 +33,12 @@ import {
   Filler,
   ChartConfiguration,
 } from 'chart.js';
-import { CashierService } from '../../core/services/cashier.service';
+import { CashierService, CashierSortField } from '../../core/services/cashier.service';
 import { AuthService } from '../../core/services/auth.service';
+import { AccessControlService } from '../../core/services/access-control.service';
 import { NotificationService } from '../../core/services/notification.service';
+import { JournalService } from '../../core/services/journal.service';
+import { DossierService } from '../../core/services/dossier.service';
 import {
   CASHIER_SERVICES,
   CashierTransaction,
@@ -48,6 +52,8 @@ import {
   normalizePieceComptable,
 } from '../../core/utils/cashier-duplicate.util';
 import { OdooDatepicker } from '../../shared/components/odoo-datepicker/odoo-datepicker';
+import { ModuleControlPanel } from '../../shared/components/module-control-panel/module-control-panel';
+import { ModuleDataTable } from '../../shared/components/module-data-table/module-data-table';
 
 // Enregistrement des composants nécessaires de Chart.js
 Chart.register(
@@ -68,12 +74,13 @@ export interface CaisseTimelineData {
 
 @Component({
   selector: 'app-cashier-management',
-  imports: [ReactiveFormsModule, MatIconModule, OdooDatepicker],
+  imports: [ReactiveFormsModule, MatIconModule, OdooDatepicker, ModuleControlPanel, ModuleDataTable],
   templateUrl: './cashier-management.html',
   styleUrl: './cashier-management.scss',
   changeDetection: ChangeDetectionStrategy.OnPush,
   host: {
     '(document:click)': 'onDocumentClick($event)',
+    '(document:keydown.escape)': 'closeActionsMenu()',
     '(document:touchstart)': 'onDocumentTouchStart($event)',
     '(document:touchmove)': 'onDocumentTouchMove($event)',
     '(document:touchend)': 'onDocumentTouchEnd($event)',
@@ -86,6 +93,11 @@ export class CashierManagement implements OnInit, AfterViewInit, OnDestroy {
   public readonly cashierService = inject(CashierService);
   private readonly notificationService = inject(NotificationService);
   private readonly authService = inject(AuthService);
+  private readonly accessControlService = inject(AccessControlService);
+  private readonly route = inject(ActivatedRoute);
+  private readonly router = inject(Router);
+  public readonly journalService = inject(JournalService);
+  public readonly dossierService = inject(DossierService);
   private readonly elementRef = inject(ElementRef);
   private readonly cdr = inject(ChangeDetectorRef);
   protected readonly Math = Math;
@@ -96,38 +108,97 @@ export class CashierManagement implements OnInit, AfterViewInit, OnDestroy {
   private touchStartX = 0;
   private touchStartY = 0;
 
-  // Permissions : Seuls admin et caissiere peuvent créer/modifier/supprimer
-  public readonly canEdit = computed(() => {
-    const role = this.authService.currentUser()?.role;
-    return role === 'admin' || role === 'caissiere';
+  // Journal actif et liste des journaux disponibles
+  public readonly activeJournalId = this.cashierService.activeJournalId;
+  public readonly activeJournalPrefix = this.cashierService.activeJournalPrefix;
+
+  public readonly availableJournals = computed(() => [
+    { id: 'native-caisse-principal', name: 'Caisse Principale', sequence_prefix: 'CSH1' },
+    ...(this.authService.currentRole() === 'caissiere'
+      ? []
+      : this.journalService.journals().filter((j) => j.id !== 'native-caisse-principal' && j.sequence_prefix !== 'CSH1')),
+  ]);
+
+  public readonly activeJournalName = computed<string>(() => {
+    const id = this.activeJournalId();
+    const found = this.availableJournals().find((j) => j.id === id);
+    return found ? found.name : 'Caisse Principale';
   });
 
-  /**
-   * Vérifie si l'utilisateur actuel a le droit d'éditer une transaction spécifique.
-   * - Admin : peut éditer toutes les lignes
-   * - Caissière : ne peut éditer que les lignes qu'elle a elle-même enregistrées ou importées (createdBy === currentUser.id)
-   * - Autres rôles : lecture seule
-   */
-  public canEditTransaction(tx: CashierTransaction): boolean {
-    const user = this.authService.currentUser();
-    if (!user) return false;
-    if (user.role === 'admin') return true;
-    if (user.role !== 'caissiere') return false;
-    // Si la ligne n'a pas encore de créateur spécifié (rétrocompatibilité), autoriser
-    if (!tx.createdBy) return true;
-    return tx.createdBy === user.id;
+  public selectJournal(journalId: string): void {
+    if (journalId === 'native-caisse-principal') {
+      this.cashierService.setActiveJournal('native-caisse-principal', 'CSH1');
+      this.router.navigate([], {
+        relativeTo: this.route,
+        queryParams: { journalId: 'native-caisse-principal' },
+        queryParamsHandling: 'merge',
+      });
+    } else {
+      const journal = this.availableJournals().find((j) => j.id === journalId);
+      const prefix = journal?.sequence_prefix || 'JRNL';
+      this.cashierService.setActiveJournal(journalId, prefix);
+      this.router.navigate([], {
+        relativeTo: this.route,
+        queryParams: { journalId },
+        queryParamsHandling: 'merge',
+      });
+    }
   }
 
-  // Sélection de lignes : autorisé pour admin, caissiere et comptable (pour l'exportation et consultation)
-  public readonly canSelect = computed(() => {
-    const role = this.authService.currentUser()?.role;
-    return role === 'admin' || role === 'caissiere' || role === 'comptable';
-  });
+  private canWriteToJournal(journalId: string | null | undefined): boolean {
+    const activeJournalId = this.cashierService.activeJournalId();
+    const targetJournalId = journalId ?? activeJournalId;
+    const isNativeCaisse =
+      !targetJournalId ||
+      targetJournalId === 'native-caisse-principal' ||
+      targetJournalId === 'CSH1' ||
+      (targetJournalId === activeJournalId && this.cashierService.activeJournalPrefix() === 'CSH1');
+
+    if (isNativeCaisse) return this.accessControlService.hasPermission('cashier.create');
+
+    const journal = this.journalService.journals().find((candidate) => candidate.id === targetJournalId);
+    return this.accessControlService.hasPermissionForResource('journal_entries.create', {
+      ownerUserId: journal?.created_by,
+    });
+  }
+
+  public readonly canEdit = computed(() => this.canWriteToJournal(this.activeJournalId()));
+
+  /** Vérifie le droit d’édition du journal réel associé à la ligne. */
+  public canEditTransaction(tx: CashierTransaction): boolean {
+    if (tx.status === 'cancelled') return false;
+    if (tx.status === 'posted' && this.authService.currentRole() === 'caissiere') return false;
+
+    const transactionJournalId = tx.journalId ?? tx.journal_id ?? 'native-caisse-principal';
+    const isNativeCaisse =
+      transactionJournalId === 'native-caisse-principal' ||
+      transactionJournalId === 'CSH1' ||
+      tx.pieceComptable?.startsWith('CSH1');
+    if (isNativeCaisse) return this.accessControlService.hasPermission('cashier.update');
+
+    const journal = this.journalService.journals().find((candidate) => candidate.id === transactionJournalId);
+    if (!this.accessControlService.hasPermissionForResource('journal_entries.update', {
+      ownerUserId: journal?.created_by,
+    })) return false;
+    return true;
+  }
+
+  public readonly canSelect = computed(() => this.accessControlService.hasPermission('cashier.read'));
 
   // Visibilité du solde de caisse en temps réel : masqué pour le rôle comptable
   public readonly canViewBalance = computed(() => {
     const role = this.authService.currentUser()?.role;
     return role !== 'comptable';
+  });
+
+  public readonly canCancelCashierOperations = computed(() => {
+    const journalId = this.cashierService.activeJournalId();
+    const isMainCashier =
+      !journalId ||
+      journalId === 'native-caisse-principal' ||
+      journalId === 'CSH1' ||
+      this.cashierService.activeJournalPrefix() === 'CSH1';
+    return isMainCashier && this.accessControlService.hasPermission('cashier.status_update');
   });
 
   // Données réactives issues du service
@@ -139,13 +210,22 @@ export class CashierManagement implements OnInit, AfterViewInit, OnDestroy {
   public readonly isAllSelected = this.cashierService.isAllSelected;
   public readonly isLoading = this.cashierService.isLoading;
   public readonly error = this.cashierService.error;
-  public readonly nextPieceComptable = this.cashierService.nextPieceComptable;
+  public readonly sortField = this.cashierService.sortField;
+  public readonly sortDirection = this.cashierService.sortDirection;
+
+  /**
+   * Bascule le tri sur un champ donné
+   */
+  public toggleSort(field: CashierSortField): void {
+    this.cashierService.toggleSort(field);
+  }
 
   // Contrôles UI synchronisés avec le service
   public readonly isAddingRow = this.cashierService.isAddingRow;
   public readonly isSubmitting = signal<boolean>(false);
-  public readonly isDeleting = signal<boolean>(false);
+  public readonly isCancelling = signal<boolean>(false);
   public readonly isFilterDropdownOpen = signal<boolean>(false);
+  public readonly isActionsMenuOpen = signal<boolean>(false);
   public readonly searchControl = new FormControl<string>('', {
     nonNullable: true,
   });
@@ -259,6 +339,7 @@ export class CashierManagement implements OnInit, AfterViewInit, OnDestroy {
       validators: [Validators.required],
     }),
     noDossier: new FormControl<string>('', { nonNullable: true }),
+    dossierId: new FormControl<string>('', { nonNullable: true }),
     employee: new FormControl<string>('', { nonNullable: true }),
     quantity: new FormControl<number | null>(null),
     montant: new FormControl<number | null>(null, {
@@ -300,6 +381,7 @@ export class CashierManagement implements OnInit, AfterViewInit, OnDestroy {
       validators: [Validators.required],
     }),
     noDossier: new FormControl<string>('', { nonNullable: true }),
+    dossierId: new FormControl<string>('', { nonNullable: true }),
     employee: new FormControl<string>('', { nonNullable: true }),
     quantity: new FormControl<number | null>(null),
     montant: new FormControl<number | null>(null, {
@@ -322,6 +404,7 @@ export class CashierManagement implements OnInit, AfterViewInit, OnDestroy {
           category: 'sortie',
           status: 'draft',
           noDossier: '',
+          dossierId: '',
           employee: '',
           quantity: null,
           montant: null,
@@ -379,6 +462,17 @@ export class CashierManagement implements OnInit, AfterViewInit, OnDestroy {
         );
       }
     });
+
+    // Synchronisation automatique du préfixe dès que la liste des journaux est disponible
+    effect(() => {
+      const curId = this.cashierService.activeJournalId();
+      if (curId && curId !== 'native-caisse-principal') {
+        const matching = this.journalService.journals().find((j) => j.id === curId);
+        if (matching && matching.sequence_prefix) {
+          this.cashierService.setActiveJournalPrefix(matching.sequence_prefix);
+        }
+      }
+    });
   }
 
   private updateOperationsValidators(form: FormGroup, isOperations: boolean): void {
@@ -401,7 +495,23 @@ export class CashierManagement implements OnInit, AfterViewInit, OnDestroy {
   public readonly todayIsoDate = signal<string>('');
 
   public ngOnInit(): void {
+    void this.journalService.loadJournals();
     this.cashierService.loadTransactions();
+
+    // Prise en compte du paramètre d'URL journalId (ex: depuis le Tableau de bord)
+    this.route.queryParams.subscribe((params) => {
+      const journalId = params['journalId'];
+      if (journalId) {
+        if (journalId === 'native-caisse-principal') {
+          this.cashierService.setActiveJournal('native-caisse-principal', 'CSH1');
+        } else {
+          const matching = this.journalService.journals().find((j) => j.id === journalId);
+          const prefix = matching?.sequence_prefix || 'JRNL';
+          this.cashierService.setActiveJournal(journalId, prefix);
+        }
+      }
+    });
+
     const today = new Date();
     const isoDate = today.toISOString().split('T')[0];
     this.todayIsoDate.set(isoDate);
@@ -563,26 +673,82 @@ export class CashierManagement implements OnInit, AfterViewInit, OnDestroy {
     this.cashierService.toggleSelectAll(!this.isAllSelected());
   }
 
-  public async deleteSelectedTransactions(): Promise<void> {
-    const count = this.selectedCount();
-    if (count === 0) return;
+  public clearSelection(): void {
+    this.cashierService.toggleSelectAll(false);
+    this.closeActionsMenu();
+  }
 
-    const confirmed = confirm(
-      `Êtes-vous sûr de vouloir supprimer ${count} transaction(s) sélectionnée(s) ?`
-    );
-    if (!confirmed) return;
+  public toggleActionsMenu(event?: Event): void {
+    event?.stopPropagation();
+    this.isActionsMenuOpen.update((open) => !open);
+  }
 
-    this.isDeleting.set(true);
+  public closeActionsMenu(): void {
+    this.isActionsMenuOpen.set(false);
+  }
+
+  public onExportAction(): void {
+    this.cashierService.exportTransactions(this.selectedCount() > 0);
+    this.closeActionsMenu();
+  }
+
+  public async onDuplicateAction(): Promise<void> {
+    if (!this.canEdit() || this.selectedCount() === 0) return;
+    this.closeActionsMenu();
+    await this.cashierService.duplicateSelected();
+  }
+
+  public async onCancelSelectedAction(): Promise<void> {
+    if (!this.canCancelCashierOperations() || this.selectedCount() === 0) return;
+    if (this.isCancelling() || !confirm(`Annuler ${this.selectedCount()} opération(s) sélectionnée(s) ? Les numéros de pièce seront conservés.`)) return;
+
+    this.isCancelling.set(true);
+    this.closeActionsMenu();
     try {
-      await this.cashierService.deleteSelected();
+      const success = await this.cashierService.cancelSelected();
+      if (!success && this.error()) console.warn('Avertissement annulation:', this.error());
     } finally {
-      this.isDeleting.set(false);
-      this.cashierService.toggleSelectAll(false);
+      this.isCancelling.set(false);
+    }
+  }
+
+  public async onResetToDraftAction(): Promise<void> {
+    if (!this.canCancelCashierOperations() || this.selectedCount() === 0) return;
+    this.closeActionsMenu();
+    await this.cashierService.resetSelectedToDraft();
+  }
+
+  public onExportSpreadsheetAction(): void {
+    this.cashierService.exportSpreadsheet();
+    this.closeActionsMenu();
+  }
+
+  public onDownloadAttachmentsAction(): void {
+    this.cashierService.downloadAttachments();
+    this.closeActionsMenu();
+  }
+
+  public onOpenImportModal(): void {
+    if (this.canEdit()) this.cashierService.openImportModal();
+  }
+
+  public prevPage(): void {
+    this.cashierService.prevPage();
+  }
+
+  public nextPage(): void {
+    this.cashierService.nextPage();
+  }
+
+  private ensureDossiersLoaded(): void {
+    if (this.dossierService.dossiers().length === 0 && !this.dossierService.isLoading()) {
+      void this.dossierService.loadDossiers({ limit: 50 });
     }
   }
 
   public async startAddInline(): Promise<void> {
     if (!this.canEdit()) return;
+    this.ensureDossiersLoaded();
 
     // Règle d'or : fermer impérativement toute ligne existante en édition avant d'ouvrir la ligne d'ajout
     if (this.editingTxId()) {
@@ -607,12 +773,42 @@ export class CashierManagement implements OnInit, AfterViewInit, OnDestroy {
       category: 'sortie',
       status: 'draft',
       noDossier: '',
+      dossierId: '',
       employee: '',
       quantity: null,
       montant: null,
     });
     this.isOperationsType.set(false);
     this.cashierService.startAddTransaction();
+    this.focusInlineAddRow();
+  }
+
+  private focusInlineAddRow(): void {
+    setTimeout(() => {
+      const row = document.getElementById('inline-add-row');
+      if (row) {
+        row.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      }
+      const libelleInput = document.getElementById('inline-input-libelle') as HTMLInputElement | null;
+      if (libelleInput) {
+        libelleInput.focus();
+        libelleInput.select();
+      }
+    }, 50);
+  }
+
+  private focusInlineEditRow(id: string): void {
+    setTimeout(() => {
+      const row = document.getElementById(`inline-edit-row-${id}`);
+      if (row) {
+        row.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      }
+      const libelleInput = document.getElementById('inline-edit-libelle') as HTMLInputElement | null;
+      if (libelleInput) {
+        libelleInput.focus();
+        libelleInput.select();
+      }
+    }, 50);
   }
 
   public cancelAddInline(): void {
@@ -625,6 +821,7 @@ export class CashierManagement implements OnInit, AfterViewInit, OnDestroy {
       category: 'sortie',
       status: 'draft',
       noDossier: '',
+      dossierId: '',
       employee: '',
       quantity: null,
       montant: null,
@@ -673,7 +870,7 @@ export class CashierManagement implements OnInit, AfterViewInit, OnDestroy {
         }
       }
 
-      // Contrôle strict anti-doublon en direct : Date + Montant + Libellé + N° de dossier + Service
+      // Contrôle strict anti-doublon au sein du journal actif : Date + Montant + Libellé + N° de dossier + Service
       const duplicate = findDuplicateTransaction(
         {
           date: formattedDate,
@@ -682,21 +879,21 @@ export class CashierManagement implements OnInit, AfterViewInit, OnDestroy {
           noDossier: formValues.noDossier,
           service: formValues.service,
         },
-        this.allTransactions()
+        this.cashierService.journalTransactions()
       );
 
       if (duplicate) {
         const montantDisplay = Math.abs(Number(duplicate.montant)).toLocaleString('fr-FR');
         const serviceDisplay = duplicate.service || 'Sans service';
-        const duplicateMsg = `Opération déjà enregistrée : une opération identique existe déjà en caisse (Date : ${duplicate.date}, Montant : ${montantDisplay} FCFA, Service : ${serviceDisplay}, Libellé : "${duplicate.libelle}"). La double saisie est interdite.`;
+        const duplicateMsg = `Opération déjà enregistrée : une opération identique existe déjà dans ce journal (Date : ${duplicate.date}, Montant : ${montantDisplay} FCFA, Service : ${serviceDisplay}, Libellé : "${duplicate.libelle}"). La double saisie est interdite.`;
         this.cashierService.setError(duplicateMsg, false);
         this.cancelAddInline();
         this.notificationService.warning(duplicateMsg, 'Doublon détecté');
         return;
       }
 
-      // Comme sur Odoo, nous ne passons pas de numéro de pièce figé à la création :
-      // le trigger PostgreSQL assigne la pièce officielle de manière atomique et sans trou.
+      // La pièce ne vient jamais du formulaire ; la base l'attribue à la comptabilisation.
+      const activeJId = this.cashierService.activeJournalId();
       const result = await this.cashierService.addTransaction({
         pieceComptable: undefined,
         date: formattedDate,
@@ -706,9 +903,12 @@ export class CashierManagement implements OnInit, AfterViewInit, OnDestroy {
         category: resolvedCategory,
         status: (formValues.status as TransactionStatus) || 'draft',
         noDossier: formValues.noDossier || undefined,
+        dossierId: formValues.dossierId || null,
         employee: formValues.employee || undefined,
         quantity: formValues.quantity !== null && formValues.quantity !== undefined ? Number(formValues.quantity) : undefined,
         montant: finalMontant,
+        journalId: activeJId,
+        journal_id: activeJId,
       });
 
       if (result.success) {
@@ -724,6 +924,7 @@ export class CashierManagement implements OnInit, AfterViewInit, OnDestroy {
 
   public async startInlineEdit(tx: CashierTransaction): Promise<void> {
     if (!this.canEdit() || !this.canEditTransaction(tx)) return;
+    this.ensureDossiersLoaded();
     if (this.editingTxId() === tx.id) return;
 
     // Règle d'or : une seule ligne ouverte à la fois.
@@ -777,12 +978,14 @@ export class CashierManagement implements OnInit, AfterViewInit, OnDestroy {
       category: tx.category || 'sortie',
       status: tx.status || 'draft',
       noDossier: tx.noDossier || '',
+      dossierId: tx.dossierId || '',
       employee: tx.employee || '',
       quantity: tx.quantity !== undefined && tx.quantity !== null ? tx.quantity : null,
       montant: tx.montant !== undefined && tx.montant !== null ? Math.abs(tx.montant) : null,
     });
 
     this.editingTxId.set(tx.id);
+    this.focusInlineEditRow(tx.id);
   }
 
   public onDocumentTouchStart(event: TouchEvent): void {
@@ -820,10 +1023,13 @@ export class CashierManagement implements OnInit, AfterViewInit, OnDestroy {
     const target = event.target as HTMLElement | null;
     if (!target) return;
 
+    if (target.closest('#cashier-actions-dropdown-container')) return;
+    this.closeActionsMenu();
+
     // Ignorer si l'élément n'est plus dans le DOM ou fait partie d'un composant flottant (popover, datepicker, dropdown)
     if (
       !document.body.contains(target) ||
-      target.closest('#cp-btn-nouveau') ||
+      target.closest('#cashier-control-create, #cp-btn-nouveau') ||
       target.closest('app-odoo-datepicker') ||
       target.closest('.odoo-datepicker-popover') ||
       target.closest('.p-dropdown') ||
@@ -884,6 +1090,25 @@ export class CashierManagement implements OnInit, AfterViewInit, OnDestroy {
       this.isAddDatePickerOpen.set(false);
       this.cancelAddInline();
     }
+  }
+
+  public isNativeCaisseTransaction(tx: CashierTransaction): boolean {
+    const journalId = tx.journalId ?? tx.journal_id;
+    return !journalId || journalId === 'native-caisse-principal' || journalId === 'CSH1';
+  }
+
+  public isNativeCaisseSelected(): boolean {
+    const journalId = this.activeJournalId();
+    return journalId === 'native-caisse-principal' || journalId === 'CSH1';
+  }
+
+  public syncDossierReference(form: FormGroup, event: Event): void {
+    const dossierId = (event.target as HTMLSelectElement | null)?.value || '';
+    const dossier = this.dossierService.dossiers().find((item) => item.id === dossierId);
+    form.patchValue({
+      dossierId,
+      ...(dossier ? { noDossier: dossier.noDossier } : {}),
+    });
   }
 
   public openAddDatePicker(event?: Event): void {
@@ -971,13 +1196,13 @@ export class CashierManagement implements OnInit, AfterViewInit, OnDestroy {
         }
       }
 
-      // Contrôle strict anti-doublon lors de l'édition
-      const existingTx = this.allTransactions().find((t) => t.id === activeId);
+      // Contrôle strict anti-doublon lors de l'édition au sein du journal
+      const existingTx = this.cashierService.journalTransactions().find((t) => t.id === activeId);
       const pieceToValidate = normalizePieceComptable(existingTx?.pieceComptable);
       if (pieceToValidate) {
-        const pieceDuplicate = findDuplicatePieceComptable({ id: activeId, pieceComptable: pieceToValidate }, this.allTransactions());
+        const pieceDuplicate = findDuplicatePieceComptable({ id: activeId, pieceComptable: pieceToValidate }, this.cashierService.journalTransactions());
         if (pieceDuplicate) {
-          const pieceMsg = `Modification refusée : le numéro de pièce comptable "${pieceToValidate}" est déjà attribué à une autre opération (ID: ${pieceDuplicate.id}, Libellé: "${pieceDuplicate.libelle}").`;
+          const pieceMsg = `Modification refusée : le numéro de pièce comptable "${pieceToValidate}" est déjà attribué à une autre opération dans ce journal (ID: ${pieceDuplicate.id}, Libellé: "${pieceDuplicate.libelle}").`;
           this.cashierService.setError(pieceMsg, false);
           this.cancelInlineEdit();
           this.notificationService.warning(pieceMsg, 'Pièce comptable en double');
@@ -995,31 +1220,35 @@ export class CashierManagement implements OnInit, AfterViewInit, OnDestroy {
           service: formValues.service,
           pieceComptable: pieceToValidate,
         },
-        this.allTransactions()
+        this.cashierService.journalTransactions()
       );
 
       if (duplicate) {
         const montantDisplay = Math.abs(Number(duplicate.montant)).toLocaleString('fr-FR');
         const serviceDisplay = duplicate.service || 'Sans service';
-        const duplicateMsg = `Modification refusée : une opération identique existe déjà en caisse (Date : ${duplicate.date}, Montant : ${montantDisplay} FCFA, Service : ${serviceDisplay}, Libellé : "${duplicate.libelle}").`;
+        const duplicateMsg = `Modification refusée : une opération identique existe déjà dans ce journal (Date : ${duplicate.date}, Montant : ${montantDisplay} FCFA, Service : ${serviceDisplay}, Libellé : "${duplicate.libelle}").`;
         this.cashierService.setError(duplicateMsg, false);
         this.cancelInlineEdit();
         this.notificationService.warning(duplicateMsg, 'Doublon détecté');
         return;
       }
 
+      const activeJId = this.cashierService.activeJournalId();
       const updateResult = await this.cashierService.updateTransaction(activeId, {
         pieceComptable: pieceToValidate,
         date: formattedDate,
         libelle: libelle,
-        service: (formValues.service as Service) || '',
+        service: (formValues.service as Service) || undefined,
         typeDescription: formValues.typeDescription || undefined,
         category: resolvedCategory,
         status: (formValues.status as TransactionStatus) || 'draft',
         noDossier: formValues.noDossier || undefined,
+        dossierId: formValues.dossierId || null,
         employee: formValues.employee || undefined,
         quantity: formValues.quantity !== null && formValues.quantity !== undefined ? Number(formValues.quantity) : undefined,
         montant: finalMontant,
+        journalId: activeJId,
+        journal_id: activeJId,
       });
 
       if (updateResult.success) {
