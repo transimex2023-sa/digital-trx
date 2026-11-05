@@ -1,6 +1,7 @@
-import { PLATFORM_ID } from '@angular/core';
+import { PLATFORM_ID, provideZonelessChangeDetection } from '@angular/core';
 import { TestBed } from '@angular/core/testing';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+
 import { CashierService } from './cashier.service';
 import { SupabaseService } from './supabase.service';
 import { AuthService } from './auth.service';
@@ -28,6 +29,7 @@ describe('CashierService - Architecture Hybride & Signals', () => {
     TestBed.configureTestingModule({
       providers: [
         CashierService,
+        provideZonelessChangeDetection(),
         { provide: PLATFORM_ID, useValue: 'browser' },
         {
           provide: NotificationService,
@@ -71,11 +73,13 @@ describe('CashierService - Architecture Hybride & Signals', () => {
         },
       ],
     });
+
     service = TestBed.inject(CashierService);
   });
 
   afterEach(() => {
     globalThis.fetch = originalFetch;
+    TestBed.resetTestingModule();
   });
 
   it('devrait être initialisé avec un solde nul et une liste vide', () => {
